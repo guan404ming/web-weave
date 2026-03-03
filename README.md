@@ -83,7 +83,7 @@ Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes UR
 | `fetcher.rs` | reqwest HTTP client with per-domain rate limiting via governor (0.5 QPS). Compression support (gzip, brotli, deflate). |
 | `parser.rs` | HTML link extraction (scraper CSS selector `a[href]`), URL normalization (remove fragments, tracking params, sort query), sitemap XML parsing. |
 | `robots.rs` | robots.txt fetch, parse (texting_robots), and cache (DashMap, 24h TTL, 10K cap with LRU eviction). Rate-limited through the same governor limiter as page fetches. |
-| `dedup.rs` | Bloom filter (50M items, 0.1% false positive rate, ~72MB). Wraps `bloomfilter::Bloom<str>` with manual bincode serialization. |
+| `dedup.rs` | Lock-free AtomicBloomFilter (1B items, 0.1% FP, ~1.7GB). Uses `fastbloom` with atomic operations, zero lock contention across 800 workers. |
 | `store.rs` | SQLite WAL persistence. Tables: `urls`, `domains`, `frontier_checkpoint`, `metrics_snapshot`. Batch inserts via dedicated writer task. |
 | `monitor.rs` | Lock-free atomic counters for throughput. Ring buffer latency tracker with p50/p95/p99 percentiles. Threshold alerting with macOS notifications and 10-min cooldown. |
 

@@ -17,8 +17,8 @@ pub const DEPTH_WEIGHT: f64 = 10.0;
 pub const NEW_DOMAIN_BONUS: f64 = 50.0;
 pub const SITEMAP_BONUS: f64 = 30.0;
 pub const MAX_URLS_PER_PAGE: usize = 500;
-pub const FRONTIER_CAPACITY: usize = 1_000_000;
-pub const FRONTIER_EVICT_BATCH: usize = 100_000;
+pub const FRONTIER_CAPACITY: usize = 5_000_000;
+pub const FRONTIER_EVICT_BATCH: usize = 500_000;
 
 // Per-domain error backoff
 pub const BACKOFF_THRESHOLD: u32 = 3;
@@ -31,7 +31,7 @@ pub const BACKOFF_RATE_MIN_ATTEMPTS: u32 = 5;
 pub const ALERT_COOLDOWN: Duration = Duration::from_secs(600);
 
 // Bloom filter: sized for 48h at ~200M unique URLs, 0.1% FP (~345MB)
-pub const BLOOM_EXPECTED_ITEMS: usize = 200_000_000;
+pub const BLOOM_EXPECTED_ITEMS: usize = 1_000_000_000;
 pub const BLOOM_FP_RATE: f64 = 0.001;
 
 // Persistence

@@ -7,6 +7,7 @@ use crate::monitor::MetricsSnapshot;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    db_path: String,
 }
 
 impl Store {
@@ -16,6 +17,7 @@ impl Store {
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: path.to_string(),
         })
     }
 
@@ -144,12 +146,17 @@ impl Store {
         Ok(())
     }
 
-    /// Save a checkpoint with serialized frontier and bloom filter data.
+    /// Save a checkpoint. Frontier goes in SQLite, bloom goes to file (too large for blob).
     pub fn save_checkpoint(&self, frontier_data: &[u8], bloom_data: &[u8]) -> Result<()> {
+        // Save bloom filter to file
+        let bloom_path = self.bloom_checkpoint_path();
+        std::fs::write(&bloom_path, bloom_data)
+            .context("write bloom checkpoint file")?;
+
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO frontier_checkpoint (frontier_data, bloom_data) VALUES (?1, ?2)",
-            params![frontier_data, bloom_data],
+            "INSERT INTO frontier_checkpoint (frontier_data, bloom_data) VALUES (?1, X'00')",
+            params![frontier_data],
         )?;
         // Keep only the last 3 checkpoints
         conn.execute(
@@ -163,19 +170,29 @@ impl Store {
 
     /// Load the most recent checkpoint.
     pub fn load_latest_checkpoint(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT frontier_data, bloom_data FROM frontier_checkpoint ORDER BY id DESC LIMIT 1",
-        )?;
-        let result = stmt
-            .query_row([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                ))
-            })
-            .optional()?;
-        Ok(result)
+        let frontier_data = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT frontier_data FROM frontier_checkpoint ORDER BY id DESC LIMIT 1",
+            )?;
+            stmt.query_row([], |row| row.get::<_, Vec<u8>>(0))
+                .optional()?
+        };
+
+        match frontier_data {
+            Some(fd) => {
+                let bloom_path = self.bloom_checkpoint_path();
+                let bloom_data = std::fs::read(&bloom_path)
+                    .context("read bloom checkpoint file")?;
+                Ok(Some((fd, bloom_data)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn bloom_checkpoint_path(&self) -> String {
+        let db_path = self.db_path.clone();
+        format!("{}.bloom", db_path.trim_end_matches(".db"))
     }
 
     /// Check if a checkpoint exists (for resume logic).

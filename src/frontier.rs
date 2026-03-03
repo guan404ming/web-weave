@@ -238,13 +238,13 @@ impl Frontier {
         inner.current_size += 1;
     }
 
-    /// Evict lowest-score URLs when capacity exceeded.
+    /// Evict lowest-score URLs when significantly over capacity.
     fn maybe_evict(inner: &mut FrontierInner) {
-        if inner.current_size <= FRONTIER_CAPACITY {
+        if inner.current_size <= FRONTIER_CAPACITY + FRONTIER_EVICT_BATCH {
             return;
         }
 
-        let to_evict = FRONTIER_EVICT_BATCH.min(inner.current_size - FRONTIER_CAPACITY);
+        let to_evict = inner.current_size - FRONTIER_CAPACITY;
 
         // Trim largest domain queues first (they contribute most to bloat)
         let mut evicted = 0;
@@ -303,7 +303,7 @@ impl Frontier {
         inner.total_evicted += evicted as u64;
 
         if evicted > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Frontier evicted {} low-score URLs (size: {})",
                 evicted,
                 inner.current_size,
