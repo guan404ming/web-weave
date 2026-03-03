@@ -27,3 +27,6 @@ target
 
 # Log files
 logs/
+
+# Bloom filter checkpoint
+*.bloom

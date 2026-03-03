@@ -2,19 +2,65 @@
 
 Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes URL discovery over a 48-hour crawl window while strictly honoring politeness constraints.
 
-## Results (10-minute sample run)
+## Results (30-minute sample run)
 
 | Metric | Value |
 |--------|-------|
-| Total discovered URLs | 3,453,117 |
-| Total successfully-crawled URLs | 79,766 |
-| Unique domains reached | 145,663 |
-| Sustained QPS | ~80 |
-| Success rate | 83-89% |
-| Avg latency (p50) | ~1,000 ms |
-| Memory usage (steady-state) | ~500 MB |
+| Total discovered URLs | 8,135,425 |
+| Total successfully-crawled URLs | 222,754 |
+| Unique domains reached | 345,827 |
+| Sustained QPS | ~128 |
+| Success rate | 77-78% |
+| Avg latency (p50) | ~550 ms |
+| Memory usage (steady-state) | ~2.5 GB |
 
-48-hour projection: ~14M fetched, 50-200M discovered.
+48-hour projection: ~17M successfully crawled, ~800M discovered, ~3.5M unique domains.
+
+## Hardware Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| RAM | 4 GB | 8 GB+ |
+| CPU | 2 cores | 4+ cores |
+| Disk | 10 GB free | 50 GB free |
+| Network | Stable broadband | Low-latency connection |
+
+The bloom filter alone uses ~1.7 GB (sized for 1B URLs at 0.1% false positive rate). The frontier can grow up to ~500 MB (5M URLs). SQLite database grows with discovered URLs. Checkpoints (frontier + bloom serialization) require temporary disk space (~2 GB).
+
+## Build and Run
+
+```bash
+# Build (requires Rust toolchain)
+cargo build --release
+
+# Run with defaults (48h crawl, 800 workers)
+cargo run --release
+
+# Custom configuration via environment
+CRAWL_HOURS=1 NUM_WORKERS=200 RESUME=true cargo run --release
+
+# Resume from last checkpoint after interruption
+RESUME=true cargo run --release
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEED_FILE` | `urls.txt` | Path to seed URL file (one URL per line) |
+| `DB_PATH` | `web_weave.db` | SQLite database path |
+| `NUM_WORKERS` | `800` | Maximum worker count |
+| `CRAWL_HOURS` | `48` | Crawl duration in hours |
+| `RESUME` | `false` | Resume from last checkpoint |
+| `LOG_DIR` | `logs` | Directory for log files |
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `web_weave.db` | SQLite database with all discovered/fetched URLs, domain stats, metrics snapshots |
+| `web_weave.bloom` | Bloom filter checkpoint (~1.7 GB) for resume support |
+| `logs/web-weave.log.*` | Daily rolling log files |
 
 ## Politeness Guarantees
 
@@ -35,7 +81,7 @@ Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes UR
 |                          Frontier                                  |
 |   Per-domain BinaryHeap (max-heap by score)                        |
 |   Round-robin VecDeque across domains                              |
-|   Capacity: 500K URLs, evicts lowest-score when full               |
+|   Capacity: 5M URLs, evicts lowest-score when full                 |
 +----+----------+----------+----------+----------+----------+---+----+
      |          |          |          |          |          |
      v          v          v          v          v          v
@@ -47,12 +93,13 @@ Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes UR
      |   1. Pop URL from frontier (round-robin)            |
      |   2. Check domain backoff                           |
      |   3. Check robots.txt (rate-limited, cached 24h)    |
-     |   4. Acquire fetch semaphore (max 200 concurrent)   |
-     |   5. Wait on per-domain rate limiter (0.5 QPS)      |
-     |   6. HTTP GET (reqwest, 30s timeout)                |
-     |   7. Parse links (scraper) or sitemap XML           |
-     |   8. Dedup via bloom filter                         |
-     |   9. Score and push new URLs to frontier            |
+     |   4. Wait on per-domain rate limiter (0.5 QPS)      |
+     |   5. Acquire fetch semaphore (max 500 concurrent)   |
+     |   6. HTTP GET (reqwest, 15s timeout)                |
+     |   7. Release semaphore immediately after response   |
+     |   8. Parse links (scraper) or sitemap XML           |
+     |   9. Batch dedup via lock-free bloom filter         |
+     |  10. Score and push new URLs to frontier            |
      |                                                     |
      +------------------+--+--+----------------------------+
                         |  |  |
@@ -63,8 +110,8 @@ Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes UR
                           |
                           v
                  +--------+----------+
-                 |   DB Writer       |   Batches up to 1000 rows
-                 |   (SQLite WAL)    |   or flushes every 1s
+                 |   DB Writer       |   Batches up to 10K rows
+                 |   (SQLite WAL)    |   or flushes every 3s
                  +-------------------+
 
   Background tasks:
@@ -79,13 +126,13 @@ Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes UR
 |--------|---------------|
 | `main.rs` | Orchestrator. Spawns workers, DB writer, checkpoint/monitor/scaler loops. Handles graceful shutdown via ctrl-c or crawl duration. |
 | `config.rs` | All tunable constants and environment-based configuration. |
-| `frontier.rs` | Per-domain priority queues (BinaryHeap) with round-robin scheduling (VecDeque). Capacity-capped at 500K with eviction of lowest-score URLs. Domain error backoff with progressive exponential backoff. |
-| `fetcher.rs` | reqwest HTTP client with per-domain rate limiting via governor (0.5 QPS). Compression support (gzip, brotli, deflate). |
-| `parser.rs` | HTML link extraction (scraper CSS selector `a[href]`), URL normalization (remove fragments, tracking params, sort query), sitemap XML parsing. |
+| `frontier.rs` | Per-domain priority queues (BinaryHeap) with round-robin scheduling (VecDeque). Capacity-capped at 5M with batch eviction. Domain error backoff with progressive exponential backoff. |
+| `fetcher.rs` | reqwest HTTP client with per-domain rate limiting via governor (0.5 QPS). Compression support (gzip, brotli, deflate). Split rate-limit wait and fetch for optimal semaphore utilization. |
+| `parser.rs` | HTML link extraction (scraper CSS selector `a[href]` with OnceLock-cached selectors), URL normalization (remove fragments, tracking params, sort query), sitemap XML parsing. |
 | `robots.rs` | robots.txt fetch, parse (texting_robots), and cache (DashMap, 24h TTL, 10K cap with LRU eviction). Rate-limited through the same governor limiter as page fetches. |
-| `dedup.rs` | Lock-free AtomicBloomFilter (1B items, 0.1% FP, ~1.7GB). Uses `fastbloom` with atomic operations, zero lock contention across 800 workers. |
-| `store.rs` | SQLite WAL persistence. Tables: `urls`, `domains`, `frontier_checkpoint`, `metrics_snapshot`. Batch inserts via dedicated writer task. |
-| `monitor.rs` | Lock-free atomic counters for throughput. Ring buffer latency tracker with p50/p95/p99 percentiles. Threshold alerting with macOS notifications and 10-min cooldown. |
+| `dedup.rs` | Lock-free AtomicBloomFilter (1B items, 0.1% FP, ~1.7 GB). Uses `fastbloom` with atomic operations, zero lock contention across 800 workers. Batch URL+domain checking in single pass. |
+| `store.rs` | SQLite WAL persistence. Tables: `urls`, `domains`, `frontier_checkpoint`, `metrics_snapshot`. Batch inserts via dedicated writer task. Bloom filter saved to separate file (too large for SQLite blob). |
+| `monitor.rs` | Lock-free atomic counters for throughput. Ring buffer latency tracker with p50/p95/p99 percentiles. Threshold alerting with 10-min cooldown. |
 
 ## URL Priority Scoring
 
@@ -97,11 +144,11 @@ score = (MAX_DEPTH - depth) * 10.0
       + (30.0 if from sitemap)
 ```
 
-The frontier pops URLs via round-robin across domains, ensuring no single domain monopolizes throughput. When the frontier exceeds 500K URLs, the largest domain queues are trimmed, keeping high-score URLs and evicting low-score ones.
+The frontier pops URLs via round-robin across domains, ensuring no single domain monopolizes throughput. When the frontier exceeds 5.5M URLs, the largest domain queues are trimmed, keeping high-score URLs and evicting low-score ones.
 
 ## Persistence and Resume
 
-Every 5 minutes, the frontier (all domain queues) and bloom filter are serialized via bincode and saved to SQLite as a checkpoint blob. On restart with `RESUME=true`, the latest checkpoint is loaded and crawling continues from where it left off. The last 3 checkpoints are retained.
+Every 5 minutes, the frontier is serialized via bincode and saved to SQLite, while the bloom filter is saved to a separate file (`web_weave.bloom`). On restart with `RESUME=true`, the latest checkpoint is loaded and crawling continues from where it left off. The last 3 checkpoints are retained.
 
 ## Dynamic Worker Scaling
 
@@ -109,10 +156,10 @@ Worker count adjusts every 30 seconds based on active domains:
 
 ```
 target_workers = (active_domains - backed_off_domains) * 0.5
-               , clamped to [10, 500]
+               , clamped to [10, 800]
 ```
 
-Workers beyond the target sleep instead of polling the frontier. A concurrency semaphore (200 permits) separately bounds in-flight HTTP requests to control memory from response bodies.
+Workers beyond the target sleep instead of polling the frontier. A concurrency semaphore (500 permits) separately bounds in-flight HTTP requests to control memory from response bodies.
 
 ## Error Handling
 
@@ -128,11 +175,11 @@ URLs from backed-off domains are re-enqueued (not lost) and retried after the ba
 
 | Component | Bound |
 |-----------|-------|
-| Frontier | 500K URLs, eviction when exceeded |
-| Bloom filter | ~72MB fixed |
+| Bloom filter | ~1.7 GB fixed (1B items, lock-free) |
+| Frontier | 5M URLs (~500 MB), batch eviction when exceeded |
 | Robots cache | 10K entries, LRU eviction of oldest 25% |
-| Connection pool | No idle connections (`pool_max_idle_per_host=0`) |
-| Response bodies | 2MB max per page, 200 concurrent fetches |
+| Connection pool | 1 idle connection per host, 15s timeout |
+| Response bodies | 2 MB max per page, 500 concurrent fetches |
 | Rate limiter | Stale keys cleaned every 5 min (`retain_recent`) |
 | Backoff state | Expired entries cleaned every 5 min |
 
@@ -141,40 +188,16 @@ URLs from backed-off domains are re-enqueued (not lost) and retried after the ba
 Every 60 seconds, the monitor logs:
 
 ```
-METRICS: [60s] discovered=+200K fetched=+5K | [total] discovered=2M fetched=50K
-         domains=100K qps=80.0 success=85.0%
-         latency p50=1000ms p95=6000ms p99=9000ms errors=+700 elapsed=600s
-         | workers=500 backed_off=10 frontier_size=500000 robots_cache=10000
+METRICS: [60s] discovered=+280K fetched=+7.5K | [total] discovered=8M fetched=222K
+         domains=346K qps=128.0 success=78.0%
+         latency p50=550ms p95=4700ms p99=7200ms errors=+1700 elapsed=1740s
+         | workers=800 backed_off=1 frontier_size=5000000 robots_cache=9400
 ```
 
-Alerts fire (with macOS notification) when:
+Alerts fire when:
 - QPS drops below 10 (after 100+ fetches)
 - Success rate drops below 50%
 - p99 latency exceeds 30 seconds
-
-## Build and Run
-
-```bash
-# Build
-cargo build --release
-
-# Run (default: 48h crawl, 500 workers)
-cargo run --release
-
-# Custom configuration via environment
-CRAWL_HOURS=1 NUM_WORKERS=200 RESUME=true cargo run --release
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SEED_FILE` | `urls.txt` | Path to seed URL file |
-| `DB_PATH` | `web_weave.db` | SQLite database path |
-| `NUM_WORKERS` | `500` | Maximum worker count |
-| `CRAWL_HOURS` | `48` | Crawl duration in hours |
-| `RESUME` | `false` | Resume from last checkpoint |
-| `LOG_DIR` | `logs` | Directory for log files |
 
 ## Dependencies
 
@@ -184,9 +207,9 @@ CRAWL_HOURS=1 NUM_WORKERS=200 RESUME=true cargo run --release
 | reqwest (rustls-tls) | HTTP client with compression |
 | scraper | HTML link extraction |
 | texting_robots | robots.txt parsing |
-| bloomfilter | URL deduplication |
+| fastbloom | Lock-free atomic bloom filter for URL deduplication |
 | rusqlite (bundled) | SQLite persistence |
 | governor | Per-domain rate limiting |
 | dashmap | Concurrent robots cache |
-| tracing + tracing-appender | Structured logging (console + file) |
+| tracing + tracing-appender | Structured logging (console + rolling file) |
 | serde + bincode | Checkpoint serialization |
