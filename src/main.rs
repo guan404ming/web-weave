@@ -394,11 +394,14 @@ async fn worker_loop(
             }
         }
 
+        // Wait on rate limiter BEFORE acquiring semaphore (don't waste slots on waiting)
+        fetcher.wait_rate_limit(&scored_url.domain).await;
+
         // Acquire fetch permit to bound concurrent connections
         let _permit = fetch_semaphore.acquire().await.unwrap();
 
-        // Fetch
-        let fetch_result = match fetcher.fetch(&scored_url.url, &scored_url.domain).await {
+        // Fetch (no rate limiter wait, already done above)
+        let fetch_result = match fetcher.fetch_direct(&scored_url.url).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("Fetch error {}: {}", scored_url.url, e);
@@ -409,6 +412,9 @@ async fn worker_loop(
                 continue;
             }
         };
+
+        // Release fetch permit immediately after HTTP response is read
+        drop(_permit);
 
         let success = fetch_result.status.is_success();
         metrics.record_fetch(fetch_result.latency_ms, success);
@@ -443,15 +449,24 @@ async fn worker_loop(
 
             let new_depth = scored_url.depth + 1;
             if new_depth <= MAX_DEPTH {
-                let mut new_urls = Vec::new();
-                for link in links {
-                    if !dedup.check_and_insert(&link) {
+                // Pre-compute domains outside the bloom lock
+                let link_domains: Vec<(String, String)> = links
+                    .into_iter()
+                    .map(|link| {
                         let domain = parser::extract_domain(&link).unwrap_or_default();
-                        let is_new = !dedup.contains(&format!("__domain__{}", domain));
-                        if is_new {
-                            dedup.check_and_insert(&format!("__domain__{}", domain));
-                        }
-                        let score = compute_score(new_depth, UrlSource::Link, is_new);
+                        (link, domain)
+                    })
+                    .collect();
+
+                // Single bloom lock for all URL + domain checks
+                let dedup_results = dedup.check_urls_with_domains(&link_domains);
+
+                let mut new_urls = Vec::new();
+                for ((link, domain), result) in
+                    link_domains.into_iter().zip(dedup_results)
+                {
+                    if let Some(domain_is_new) = result {
+                        let score = compute_score(new_depth, UrlSource::Link, domain_is_new);
                         new_urls.push(ScoredUrl {
                             url: link,
                             domain,

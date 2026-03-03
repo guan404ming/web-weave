@@ -36,8 +36,29 @@ impl Dedup {
         }
     }
 
-    pub fn contains(&self, url: &str) -> bool {
-        self.filter.lock().unwrap().check(url)
+    /// Batch check: for each (url, domain), returns None if URL already seen,
+    /// or Some(domain_is_new) if URL is new. Single lock acquisition for all items.
+    pub fn check_urls_with_domains(&self, items: &[(String, String)]) -> Vec<Option<bool>> {
+        let mut f = self.filter.lock().unwrap();
+        let mut domain_key = String::with_capacity(128);
+        items
+            .iter()
+            .map(|(url, domain)| {
+                if f.check(url.as_str()) {
+                    return None; // already seen
+                }
+                f.set(url.as_str());
+                // Check domain newness with reusable buffer
+                domain_key.clear();
+                domain_key.push_str("__domain__");
+                domain_key.push_str(domain);
+                let is_new = !f.check(&domain_key);
+                if is_new {
+                    f.set(&domain_key);
+                }
+                Some(is_new)
+            })
+            .collect()
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {

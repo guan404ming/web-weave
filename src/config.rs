@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 // Concurrency
-pub const NUM_WORKERS: usize = 500;
-pub const MAX_CONCURRENT_FETCHES: usize = 200;
-pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const NUM_WORKERS: usize = 800;
+pub const MAX_CONCURRENT_FETCHES: usize = 500;
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 // Rate limiting: 1 request per 2 seconds per domain
@@ -17,26 +17,26 @@ pub const DEPTH_WEIGHT: f64 = 10.0;
 pub const NEW_DOMAIN_BONUS: f64 = 50.0;
 pub const SITEMAP_BONUS: f64 = 30.0;
 pub const MAX_URLS_PER_PAGE: usize = 500;
-pub const FRONTIER_CAPACITY: usize = 500_000; // max pending URLs in memory
-pub const FRONTIER_EVICT_BATCH: usize = 50_000; // evict this many when cap hit
+pub const FRONTIER_CAPACITY: usize = 1_000_000;
+pub const FRONTIER_EVICT_BATCH: usize = 100_000;
 
 // Per-domain error backoff
-pub const BACKOFF_THRESHOLD: u32 = 3;              // consecutive failures before backoff
+pub const BACKOFF_THRESHOLD: u32 = 3;
 pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
-pub const BACKOFF_MAX: Duration = Duration::from_secs(3600); // max 1h backoff
-pub const BACKOFF_RATE_THRESHOLD: f64 = 0.5;       // back off if failure rate > 50%
-pub const BACKOFF_RATE_MIN_ATTEMPTS: u32 = 5;      // min attempts before rate-based backoff
+pub const BACKOFF_MAX: Duration = Duration::from_secs(3600);
+pub const BACKOFF_RATE_THRESHOLD: f64 = 0.5;
+pub const BACKOFF_RATE_MIN_ATTEMPTS: u32 = 5;
 
 // Alert cooldown
-pub const ALERT_COOLDOWN: Duration = Duration::from_secs(600); // 10 min between same alert type
+pub const ALERT_COOLDOWN: Duration = Duration::from_secs(600);
 
-// Bloom filter
-pub const BLOOM_EXPECTED_ITEMS: usize = 50_000_000;
+// Bloom filter: sized for 48h at ~200M unique URLs, 0.1% FP (~345MB)
+pub const BLOOM_EXPECTED_ITEMS: usize = 200_000_000;
 pub const BLOOM_FP_RATE: f64 = 0.001;
 
 // Persistence
-pub const BATCH_SIZE: usize = 1000;
-pub const BATCH_TIMEOUT: Duration = Duration::from_secs(1);
+pub const BATCH_SIZE: usize = 10_000;
+pub const BATCH_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(300);
 
 // Monitoring
@@ -45,8 +45,8 @@ pub const _CRAWL_DURATION: Duration = Duration::from_secs(48 * 3600);
 pub const LATENCY_BUFFER_SIZE: usize = 10_000;
 
 // Robots
-pub const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(86400); // 24h
-pub const ROBOTS_CACHE_MAX_SIZE: usize = 10_000;   // max cached robots.txt entries
+pub const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(86400);
+pub const ROBOTS_CACHE_MAX_SIZE: usize = 10_000;
 
 // User agent
 pub const USER_AGENT: &str = "WebWeaveBot/0.1";

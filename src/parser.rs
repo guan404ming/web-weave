@@ -1,5 +1,17 @@
+use std::sync::OnceLock;
+
 use scraper::{Html, Selector};
 use url::Url;
+
+fn link_selector() -> &'static Selector {
+    static SEL: OnceLock<Selector> = OnceLock::new();
+    SEL.get_or_init(|| Selector::parse("a[href]").unwrap())
+}
+
+fn loc_selector() -> &'static Selector {
+    static SEL: OnceLock<Selector> = OnceLock::new();
+    SEL.get_or_init(|| Selector::parse("loc").unwrap())
+}
 
 /// Non-crawlable file extensions.
 const SKIP_EXTENSIONS: &[&str] = &[
@@ -33,13 +45,10 @@ pub fn extract_links(html_body: &str, base_url: &str, max_links: usize) -> Vec<S
     };
 
     let document = Html::parse_document(html_body);
-    let selector = match Selector::parse("a[href]") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    let selector = link_selector();
 
     let mut links = Vec::new();
-    for element in document.select(&selector) {
+    for element in document.select(selector) {
         if links.len() >= max_links {
             break;
         }
@@ -55,13 +64,10 @@ pub fn extract_links(html_body: &str, base_url: &str, max_links: usize) -> Vec<S
 /// Parse a sitemap XML and extract <loc> URLs.
 pub fn parse_sitemap_xml(xml: &str, max_urls: usize) -> Vec<String> {
     let document = Html::parse_document(xml);
-    let selector = match Selector::parse("loc") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    let selector = loc_selector();
 
     let mut urls = Vec::new();
-    for element in document.select(&selector) {
+    for element in document.select(selector) {
         if urls.len() >= max_urls {
             break;
         }

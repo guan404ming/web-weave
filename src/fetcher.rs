@@ -32,7 +32,8 @@ impl Fetcher {
             .timeout(HTTP_TIMEOUT)
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::limited(5))
-            .pool_max_idle_per_host(0)
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(15))
             .gzip(true)
             .brotli(true)
             .deflate(true)
@@ -46,13 +47,16 @@ impl Fetcher {
         Ok(Self { client, limiter })
     }
 
-    /// Fetch a URL, respecting per-domain rate limits.
-    pub async fn fetch(&self, url: &str, domain: &str) -> Result<FetchResult> {
+    /// Wait on the per-domain rate limiter without making a request.
+    pub async fn wait_rate_limit(&self, domain: &str) {
         let jitter = Jitter::up_to(Duration::from_millis(200));
         self.limiter
             .until_key_ready_with_jitter(&domain.to_string(), jitter)
             .await;
+    }
 
+    /// Fetch a URL without rate limiter wait (caller must call wait_rate_limit first).
+    pub async fn fetch_direct(&self, url: &str) -> Result<FetchResult> {
         let start = Instant::now();
         let resp = self.client.get(url).send().await?;
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -76,7 +80,12 @@ impl Fetcher {
             if is_html {
                 let text = resp.text().await?;
                 if text.len() > MAX_RESPONSE_BYTES {
-                    Some(text[..MAX_RESPONSE_BYTES].to_string())
+                    // Find a valid UTF-8 char boundary at or before the limit
+                    let mut end = MAX_RESPONSE_BYTES;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    Some(text[..end].to_string())
                 } else {
                     Some(text)
                 }
