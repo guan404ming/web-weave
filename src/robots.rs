@@ -1,12 +1,15 @@
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use dashmap::DashMap;
+use governor::Jitter;
 use reqwest::Client;
 use texting_robots::Robot;
 use url::Url;
 
 use crate::config::{ROBOTS_CACHE_MAX_SIZE, ROBOTS_CACHE_TTL, USER_AGENT};
+use crate::fetcher::KeyedLimiter;
 
 struct CachedRobots {
     robot: Robot,
@@ -17,13 +20,15 @@ struct CachedRobots {
 pub struct RobotsManager {
     cache: DashMap<String, Option<CachedRobots>>,
     client: Client,
+    limiter: Arc<KeyedLimiter>,
 }
 
 impl RobotsManager {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, limiter: Arc<KeyedLimiter>) -> Self {
         Self {
             cache: DashMap::new(),
             client,
+            limiter,
         }
     }
 
@@ -63,6 +68,11 @@ impl RobotsManager {
         })
     }
 
+    /// Number of cached entries.
+    pub fn cache_size(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Ensure robots.txt is cached for the given domain.
     async fn ensure_cached(&self, url: &str, domain: &str) -> Result<()> {
         // Check if already cached and not stale
@@ -72,29 +82,42 @@ impl RobotsManager {
                     return Ok(());
                 }
             } else {
-                // Failed fetch is cached, check staleness
+                // Failed fetch is cached
                 return Ok(());
             }
         }
 
         // Evict oldest entries if cache is too large
         if self.cache.len() > ROBOTS_CACHE_MAX_SIZE {
-            let stale_keys: Vec<String> = self
+            let mut entries: Vec<(String, Instant)> = self
                 .cache
                 .iter()
                 .filter_map(|entry| {
-                    entry
+                    let fetched = entry
                         .value()
                         .as_ref()
-                        .filter(|c| c.fetched_at.elapsed() > ROBOTS_CACHE_TTL / 2)
-                        .map(|_| entry.key().clone())
+                        .map(|c| c.fetched_at)
+                        .unwrap_or(Instant::now());
+                    Some((entry.key().clone(), fetched))
                 })
-                .take(ROBOTS_CACHE_MAX_SIZE / 4)
                 .collect();
-            for key in stale_keys {
+            entries.sort_by_key(|(_, t)| *t);
+            let evict_count = entries.len() / 4;
+            for (key, _) in entries.into_iter().take(evict_count) {
                 self.cache.remove(&key);
             }
+            tracing::debug!(
+                "Robots cache evicted {} entries (size: {})",
+                evict_count,
+                self.cache.len(),
+            );
         }
+
+        // Rate limit the robots.txt fetch (same limiter as page fetches)
+        let jitter = Jitter::up_to(Duration::from_millis(200));
+        self.limiter
+            .until_key_ready_with_jitter(&domain.to_string(), jitter)
+            .await;
 
         // Fetch robots.txt
         let robots_url = Self::robots_url(url, domain)?;
@@ -121,7 +144,7 @@ impl RobotsManager {
         let resp = self
             .client
             .get(robots_url)
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
             .send()
             .await?;
 
@@ -132,7 +155,6 @@ impl RobotsManager {
         let body = resp.bytes().await?;
         let robot = Robot::new(USER_AGENT, &body)?;
 
-        // Extract sitemap URLs
         let sitemaps: Vec<String> = robot
             .sitemaps
             .iter()
@@ -146,15 +168,5 @@ impl RobotsManager {
         let parsed = Url::parse(url)?;
         let scheme = parsed.scheme();
         Ok(format!("{}://{}/robots.txt", scheme, domain))
-    }
-
-    /// Remove stale entries from the cache.
-    #[allow(dead_code)]
-    pub fn evict_stale(&self) {
-        self.cache.retain(|_, v| {
-            v.as_ref()
-                .map(|c| c.fetched_at.elapsed() < ROBOTS_CACHE_TTL)
-                .unwrap_or(false)
-        });
     }
 }

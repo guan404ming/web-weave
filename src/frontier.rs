@@ -171,6 +171,15 @@ impl DomainBackoff {
             .filter(|e| now < e.backoff_until)
             .count()
     }
+
+    /// Remove expired backoff entries to free memory.
+    pub fn cleanup(&self) -> usize {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let before = state.len();
+        state.retain(|_, e| now < e.backoff_until);
+        before - state.len()
+    }
 }
 
 #[derive(Serialize, Deserialize)]

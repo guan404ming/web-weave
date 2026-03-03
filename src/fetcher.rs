@@ -22,7 +22,7 @@ pub struct FetchResult {
 
 pub struct Fetcher {
     pub client: Client,
-    limiter: Arc<KeyedLimiter>,
+    pub limiter: Arc<KeyedLimiter>,
 }
 
 impl Fetcher {

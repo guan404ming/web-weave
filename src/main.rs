@@ -88,7 +88,10 @@ async fn main() -> Result<()> {
     );
 
     let fetcher = Arc::new(Fetcher::new()?);
-    let robots = Arc::new(RobotsManager::new(fetcher.client.clone()));
+    let robots = Arc::new(RobotsManager::new(
+        fetcher.client.clone(),
+        fetcher.limiter.clone(),
+    ));
     let metrics = Arc::new(Metrics::new());
     let backoff = Arc::new(DomainBackoff::new());
     let active_workers = Arc::new(AtomicUsize::new(0));
@@ -123,8 +126,20 @@ async fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         let backoff = backoff.clone();
         let active_workers = active_workers.clone();
+        let robots = robots.clone();
+        let fetcher = fetcher.clone();
         tokio::spawn(async move {
-            monitor_loop(metrics, frontier, store, shutdown, backoff, active_workers).await;
+            monitor_loop(
+                metrics,
+                frontier,
+                store,
+                shutdown,
+                backoff,
+                active_workers,
+                robots,
+                fetcher,
+            )
+            .await;
         })
     };
 
@@ -548,31 +563,50 @@ async fn monitor_loop(
     shutdown: Arc<AtomicBool>,
     backoff: Arc<DomainBackoff>,
     active_workers: Arc<AtomicUsize>,
+    robots: Arc<RobotsManager>,
+    fetcher: Arc<Fetcher>,
 ) {
     let mut interval = tokio::time::interval(SNAPSHOT_INTERVAL);
     interval.tick().await;
+    let mut tick_count: u64 = 0;
 
     loop {
         interval.tick().await;
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
+        tick_count += 1;
 
         let active_domains = frontier.active_domain_count() as u64;
         let snapshot = metrics.snapshot(active_domains);
         let workers = active_workers.load(Ordering::Relaxed);
         let backed_off = backoff.backed_off_count();
+        let robots_cached = robots.cache_size();
         tracing::info!(
-            "METRICS: {} | workers={} backed_off={} frontier_size={}",
+            "METRICS: {} | workers={} backed_off={} frontier_size={} robots_cache={}",
             snapshot,
             workers,
             backed_off,
             frontier.len(),
+            robots_cached,
         );
         metrics.check_alerts(&snapshot);
 
         if let Err(e) = store.save_metrics(&snapshot) {
             tracing::error!("Failed to save metrics: {}", e);
+        }
+
+        // Periodic cleanup every 5 minutes (every 5 ticks at 60s interval)
+        if tick_count % 5 == 0 {
+            let backoff_cleaned = backoff.cleanup();
+            fetcher.limiter.retain_recent();
+            fetcher.limiter.shrink_to_fit();
+            if backoff_cleaned > 0 {
+                tracing::info!(
+                    "Cleanup: backoff={} entries removed",
+                    backoff_cleaned,
+                );
+            }
         }
     }
 }
