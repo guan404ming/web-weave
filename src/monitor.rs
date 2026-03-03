@@ -101,16 +101,20 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
+        Self::with_initial(0, 0)
+    }
+
+    pub fn with_initial(discovered: u64, fetched: u64) -> Self {
         Self {
-            urls_discovered: AtomicU64::new(0),
-            urls_fetched: AtomicU64::new(0),
+            urls_discovered: AtomicU64::new(discovered),
+            urls_fetched: AtomicU64::new(fetched),
             fetch_successes: AtomicU64::new(0),
             fetch_errors: AtomicU64::new(0),
             robots_blocked: AtomicU64::new(0),
             latencies: Mutex::new(LatencyTracker::new(LATENCY_BUFFER_SIZE)),
             started_at: Instant::now(),
-            last_fetched: AtomicU64::new(0),
-            last_discovered: AtomicU64::new(0),
+            last_fetched: AtomicU64::new(fetched),
+            last_discovered: AtomicU64::new(discovered),
             alert_cooldowns: Mutex::new(HashMap::new()),
         }
     }

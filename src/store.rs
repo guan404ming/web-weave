@@ -195,6 +195,20 @@ impl Store {
         format!("{}.bloom", db_path.trim_end_matches(".db"))
     }
 
+    /// Load the latest metrics snapshot for resume.
+    pub fn load_latest_metrics(&self) -> Result<Option<(u64, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT urls_discovered, urls_fetched FROM metrics_snapshot ORDER BY id DESC LIMIT 1",
+        )?;
+        let result = stmt
+            .query_row([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })
+            .optional()?;
+        Ok(result)
+    }
+
     /// Check if a checkpoint exists (for resume logic).
     #[allow(dead_code)]
     pub fn has_checkpoint(&self) -> Result<bool> {

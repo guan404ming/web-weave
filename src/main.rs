@@ -92,7 +92,17 @@ async fn main() -> Result<()> {
         fetcher.client.clone(),
         fetcher.limiter.clone(),
     ));
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Arc::new(if config.resume {
+        match store.load_latest_metrics() {
+            Ok(Some((discovered, fetched))) => {
+                tracing::info!("Restoring metrics: discovered={}, fetched={}", discovered, fetched);
+                Metrics::with_initial(discovered, fetched)
+            }
+            _ => Metrics::new(),
+        }
+    } else {
+        Metrics::new()
+    });
     let backoff = Arc::new(DomainBackoff::new());
     let active_workers = Arc::new(AtomicUsize::new(0));
     let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
