@@ -131,7 +131,6 @@ impl Metrics {
 
         let prev_fetched = self.last_fetched.swap(fetched, Ordering::Relaxed);
         let delta = fetched.saturating_sub(prev_fetched);
-        // QPS over the snapshot interval (60 seconds by default)
         let qps = delta as f64 / 60.0;
 
         let total = successes + errors;
@@ -162,19 +161,37 @@ impl Metrics {
 
     pub fn check_alerts(&self, snapshot: &MetricsSnapshot) {
         if snapshot.urls_fetched > 100 && snapshot.current_qps < 10.0 {
-            tracing::warn!("ALERT: Low throughput, QPS={:.1}", snapshot.current_qps);
+            let msg = format!("Low throughput: QPS={:.1}", snapshot.current_qps);
+            tracing::warn!("ALERT: {}", msg);
+            notify(&msg);
         }
         if snapshot.urls_fetched > 100 && snapshot.success_rate < 0.5 {
-            tracing::warn!(
-                "ALERT: High error rate, success={:.1}%",
+            let msg = format!(
+                "High error rate: success={:.1}%",
                 snapshot.success_rate * 100.0
             );
+            tracing::warn!("ALERT: {}", msg);
+            notify(&msg);
         }
         if snapshot.p99_latency_ms > 30_000 {
-            tracing::warn!(
-                "ALERT: High tail latency, p99={}ms",
-                snapshot.p99_latency_ms
-            );
+            let msg = format!("High tail latency: p99={}ms", snapshot.p99_latency_ms);
+            tracing::warn!("ALERT: {}", msg);
+            notify(&msg);
         }
     }
+}
+
+/// Send a macOS alert dialog via osascript.
+/// Uses "display alert" which stays on screen until dismissed.
+fn notify(message: &str) {
+    let script = format!(
+        "display alert \"web-weave Alert\" message \"{}\" as critical",
+        message.replace('\"', "\\\""),
+    );
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output();
+    });
 }

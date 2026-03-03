@@ -32,13 +32,14 @@ pub const _CRAWL_DURATION: Duration = Duration::from_secs(48 * 3600);
 pub const LATENCY_BUFFER_SIZE: usize = 10_000;
 
 // Robots
-pub const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(3600);
+pub const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(86400); // 24h
 
 // User agent
 pub const USER_AGENT: &str = "WebWeaveBot/0.1";
 
 pub const DEFAULT_SEED_FILE: &str = "urls.txt";
 pub const DEFAULT_DB_PATH: &str = "web_weave.db";
+pub const DEFAULT_LOG_DIR: &str = "logs";
 
 pub struct Config {
     pub seed_file: String,

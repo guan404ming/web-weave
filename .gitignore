@@ -24,3 +24,6 @@ target
 *.db
 *.db-wal
 *.db-shm
+
+# Log files
+logs/
