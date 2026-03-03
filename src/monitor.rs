@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::config::LATENCY_BUFFER_SIZE;
+use crate::config::{ALERT_COOLDOWN, LATENCY_BUFFER_SIZE};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricsSnapshot {
     pub urls_discovered: u64,
     pub urls_fetched: u64,
+    pub discovered_last_minute: u64,
+    pub fetched_last_minute: u64,
     pub active_domains: u64,
     pub current_qps: f64,
     pub success_rate: f64,
@@ -22,8 +25,11 @@ impl std::fmt::Display for MetricsSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "discovered={} fetched={} domains={} qps={:.1} success={:.1}% \
-             latency p50={}ms p95={}ms p99={}ms errors={} elapsed={}s",
+            "[60s] discovered=+{} fetched=+{} | [total] discovered={} fetched={} \
+             domains={} qps={:.1} success={:.1}% \
+             latency p50={}ms p95={}ms p99={}ms errors=+{} elapsed={}s",
+            self.discovered_last_minute,
+            self.fetched_last_minute,
             self.urls_discovered,
             self.urls_fetched,
             self.active_domains,
@@ -89,6 +95,8 @@ pub struct Metrics {
     latencies: Mutex<LatencyTracker>,
     started_at: Instant,
     last_fetched: AtomicU64,
+    last_discovered: AtomicU64,
+    alert_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl Metrics {
@@ -102,6 +110,8 @@ impl Metrics {
             latencies: Mutex::new(LatencyTracker::new(LATENCY_BUFFER_SIZE)),
             started_at: Instant::now(),
             last_fetched: AtomicU64::new(0),
+            last_discovered: AtomicU64::new(0),
+            alert_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,9 +139,13 @@ impl Metrics {
         let errors = self.fetch_errors.load(Ordering::Relaxed);
         let elapsed = self.started_at.elapsed().as_secs().max(1);
 
+        let discovered = self.urls_discovered.load(Ordering::Relaxed);
+        let prev_discovered = self.last_discovered.swap(discovered, Ordering::Relaxed);
+        let discovered_delta = discovered.saturating_sub(prev_discovered);
+
         let prev_fetched = self.last_fetched.swap(fetched, Ordering::Relaxed);
-        let delta = fetched.saturating_sub(prev_fetched);
-        let qps = delta as f64 / 60.0;
+        let fetched_delta = fetched.saturating_sub(prev_fetched);
+        let qps = fetched_delta as f64 / 60.0;
 
         let total = successes + errors;
         let success_rate = if total > 0 {
@@ -146,15 +160,17 @@ impl Metrics {
         let p99 = tracker.percentile(99.0);
 
         MetricsSnapshot {
-            urls_discovered: self.urls_discovered.load(Ordering::Relaxed),
+            urls_discovered: discovered,
             urls_fetched: fetched,
+            discovered_last_minute: discovered_delta,
+            fetched_last_minute: fetched_delta,
             active_domains,
             current_qps: qps,
             success_rate,
             p50_latency_ms: p50,
             p95_latency_ms: p95,
             p99_latency_ms: p99,
-            errors_last_minute: delta.saturating_sub((delta as f64 * success_rate) as u64),
+            errors_last_minute: fetched_delta.saturating_sub((fetched_delta as f64 * success_rate) as u64),
             elapsed_secs: elapsed,
         }
     }
@@ -163,7 +179,7 @@ impl Metrics {
         if snapshot.urls_fetched > 100 && snapshot.current_qps < 10.0 {
             let msg = format!("Low throughput: QPS={:.1}", snapshot.current_qps);
             tracing::warn!("ALERT: {}", msg);
-            notify(&msg);
+            self.notify("low_qps", &msg);
         }
         if snapshot.urls_fetched > 100 && snapshot.success_rate < 0.5 {
             let msg = format!(
@@ -171,27 +187,35 @@ impl Metrics {
                 snapshot.success_rate * 100.0
             );
             tracing::warn!("ALERT: {}", msg);
-            notify(&msg);
+            self.notify("high_error", &msg);
         }
         if snapshot.p99_latency_ms > 30_000 {
             let msg = format!("High tail latency: p99={}ms", snapshot.p99_latency_ms);
             tracing::warn!("ALERT: {}", msg);
-            notify(&msg);
+            self.notify("high_latency", &msg);
         }
     }
-}
 
-/// Send a macOS alert dialog via osascript.
-/// Uses "display alert" which stays on screen until dismissed.
-fn notify(message: &str) {
-    let script = format!(
-        "display alert \"web-weave Alert\" message \"{}\" as critical",
-        message.replace('\"', "\\\""),
-    );
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output();
-    });
+    /// Send a macOS notification with cooldown per alert type.
+    fn notify(&self, alert_type: &str, message: &str) {
+        let now = Instant::now();
+        let mut cooldowns = self.alert_cooldowns.lock().unwrap();
+        if let Some(last) = cooldowns.get(alert_type) {
+            if now.duration_since(*last) < ALERT_COOLDOWN {
+                return; // still in cooldown
+            }
+        }
+        cooldowns.insert(alert_type.to_string(), now);
+
+        let script = format!(
+            "display notification \"{}\" with title \"web-weave\" subtitle \"Alert\" sound name \"Funk\"",
+            message.replace('\"', "\\\""),
+        );
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .output();
+        });
+    }
 }

@@ -32,7 +32,7 @@ impl Fetcher {
             .timeout(HTTP_TIMEOUT)
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::limited(5))
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(0)
             .gzip(true)
             .brotli(true)
             .deflate(true)

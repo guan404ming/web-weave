@@ -62,6 +62,8 @@ impl Store {
                 snapshot_at TEXT NOT NULL DEFAULT (datetime('now')),
                 urls_discovered INTEGER NOT NULL,
                 urls_fetched INTEGER NOT NULL,
+                discovered_last_minute INTEGER NOT NULL DEFAULT 0,
+                fetched_last_minute INTEGER NOT NULL DEFAULT 0,
                 active_domains INTEGER NOT NULL,
                 current_qps REAL NOT NULL,
                 success_rate REAL NOT NULL,
@@ -193,14 +195,18 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO metrics_snapshot (
-                urls_discovered, urls_fetched, active_domains,
+                urls_discovered, urls_fetched,
+                discovered_last_minute, fetched_last_minute,
+                active_domains,
                 current_qps, success_rate,
                 p50_latency_ms, p95_latency_ms, p99_latency_ms,
                 errors_last_minute
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 snapshot.urls_discovered as i64,
                 snapshot.urls_fetched as i64,
+                snapshot.discovered_last_minute as i64,
+                snapshot.fetched_last_minute as i64,
                 snapshot.active_domains as i64,
                 snapshot.current_qps,
                 snapshot.success_rate,

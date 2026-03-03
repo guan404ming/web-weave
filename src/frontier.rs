@@ -1,11 +1,16 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::*;
+use crate::config::{
+    BACKOFF_BASE, BACKOFF_MAX, BACKOFF_RATE_MIN_ATTEMPTS, BACKOFF_RATE_THRESHOLD,
+    BACKOFF_THRESHOLD, DEPTH_WEIGHT, FRONTIER_CAPACITY, FRONTIER_EVICT_BATCH, MAX_DEPTH,
+    NEW_DOMAIN_BONUS, SITEMAP_BONUS,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UrlSource {
@@ -61,12 +66,121 @@ pub fn compute_score(depth: u32, source: UrlSource, is_new_domain: bool) -> f64 
     depth_score + source_bonus + domain_bonus
 }
 
+/// Per-domain error backoff state.
+/// Tracks both consecutive failures and overall success/failure ratio.
+pub struct DomainBackoff {
+    state: Mutex<HashMap<String, BackoffEntry>>,
+}
+
+struct BackoffEntry {
+    consecutive_failures: u32,
+    total_successes: u32,
+    total_failures: u32,
+    times_backed_off: u32,
+    backoff_until: Instant,
+}
+
+impl DomainBackoff {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a successful fetch for a domain.
+    pub fn record_success(&self, domain: &str) {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entry(domain.to_string()).or_insert(BackoffEntry {
+            consecutive_failures: 0,
+            total_successes: 0,
+            total_failures: 0,
+            times_backed_off: 0,
+            backoff_until: Instant::now(),
+        });
+        entry.consecutive_failures = 0;
+        entry.total_successes += 1;
+    }
+
+    /// Record a failed fetch. Returns true if the domain should be backed off.
+    pub fn record_failure(&self, domain: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entry(domain.to_string()).or_insert(BackoffEntry {
+            consecutive_failures: 0,
+            total_successes: 0,
+            total_failures: 0,
+            times_backed_off: 0,
+            backoff_until: Instant::now(),
+        });
+        entry.consecutive_failures += 1;
+        entry.total_failures += 1;
+
+        // Trigger 1: consecutive failures
+        let consecutive_trigger = entry.consecutive_failures >= BACKOFF_THRESHOLD;
+
+        // Trigger 2: high failure rate over enough attempts
+        let total = entry.total_successes + entry.total_failures;
+        let failure_rate = entry.total_failures as f64 / total as f64;
+        let rate_trigger =
+            total >= BACKOFF_RATE_MIN_ATTEMPTS && failure_rate > BACKOFF_RATE_THRESHOLD;
+
+        if consecutive_trigger || rate_trigger {
+            // Progressive backoff: each time a domain is backed off, increase duration
+            let severity = entry.times_backed_off
+                + if consecutive_trigger {
+                    entry.consecutive_failures - BACKOFF_THRESHOLD
+                } else {
+                    0
+                };
+            let backoff_secs =
+                BACKOFF_BASE.as_secs_f64() * 2f64.powi(severity as i32);
+            let backoff = std::time::Duration::from_secs_f64(
+                backoff_secs.min(BACKOFF_MAX.as_secs_f64()),
+            );
+            entry.backoff_until = Instant::now() + backoff;
+            entry.times_backed_off += 1;
+            tracing::debug!(
+                "Domain {} backed off for {:.0}s (consec={}, rate={:.0}%, times={})",
+                domain,
+                backoff.as_secs_f64(),
+                entry.consecutive_failures,
+                failure_rate * 100.0,
+                entry.times_backed_off,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a domain is currently in backoff.
+    pub fn is_backed_off(&self, domain: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        if let Some(entry) = state.get(domain) {
+            Instant::now() < entry.backoff_until
+        } else {
+            false
+        }
+    }
+
+    /// Number of domains currently in backoff.
+    pub fn backed_off_count(&self) -> usize {
+        let now = Instant::now();
+        let state = self.state.lock().unwrap();
+        state
+            .values()
+            .filter(|e| now < e.backoff_until)
+            .count()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct FrontierInner {
     domain_queues: HashMap<String, BinaryHeap<ScoredUrl>>,
     active_domains: VecDeque<String>,
     active_set: HashSet<String>,
     total_enqueued: u64,
+    total_evicted: u64,
+    current_size: usize,
 }
 
 pub struct Frontier {
@@ -81,12 +195,27 @@ impl Frontier {
                 active_domains: VecDeque::new(),
                 active_set: HashSet::new(),
                 total_enqueued: 0,
+                total_evicted: 0,
+                current_size: 0,
             }),
         }
     }
 
     pub fn push(&self, item: ScoredUrl) {
         let mut inner = self.inner.lock().unwrap();
+        Self::push_inner(&mut inner, item);
+        Self::maybe_evict(&mut inner);
+    }
+
+    pub fn push_batch(&self, items: Vec<ScoredUrl>) {
+        let mut inner = self.inner.lock().unwrap();
+        for item in items {
+            Self::push_inner(&mut inner, item);
+        }
+        Self::maybe_evict(&mut inner);
+    }
+
+    fn push_inner(inner: &mut FrontierInner, item: ScoredUrl) {
         let domain = item.domain.clone();
         inner
             .domain_queues
@@ -97,21 +226,79 @@ impl Frontier {
             inner.active_domains.push_back(domain);
         }
         inner.total_enqueued += 1;
+        inner.current_size += 1;
     }
 
-    pub fn push_batch(&self, items: Vec<ScoredUrl>) {
-        let mut inner = self.inner.lock().unwrap();
-        for item in items {
-            let domain = item.domain.clone();
-            inner
-                .domain_queues
-                .entry(domain.clone())
-                .or_default()
-                .push(item);
-            if inner.active_set.insert(domain.clone()) {
-                inner.active_domains.push_back(domain);
+    /// Evict lowest-score URLs when capacity exceeded.
+    fn maybe_evict(inner: &mut FrontierInner) {
+        if inner.current_size <= FRONTIER_CAPACITY {
+            return;
+        }
+
+        let to_evict = FRONTIER_EVICT_BATCH.min(inner.current_size - FRONTIER_CAPACITY);
+
+        // Trim largest domain queues first (they contribute most to bloat)
+        let mut evicted = 0;
+        let mut empty_domains = Vec::new();
+
+        // Strategy: trim the largest queues first (they contribute most to bloat)
+        let mut domain_sizes: Vec<(String, usize)> = inner
+            .domain_queues
+            .iter()
+            .map(|(d, q)| (d.clone(), q.len()))
+            .collect();
+        domain_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (domain, _) in domain_sizes {
+            if evicted >= to_evict {
+                break;
             }
-            inner.total_enqueued += 1;
+            if let Some(queue) = inner.domain_queues.get_mut(&domain) {
+                // Keep at most half of each large queue's items
+                let keep = queue.len() / 2;
+                let drop_count = (queue.len() - keep).min(to_evict - evicted);
+                if drop_count == 0 {
+                    continue;
+                }
+
+                // Drain into vec, sort, keep top, rebuild
+                let items: Vec<ScoredUrl> = std::mem::take(queue).into_vec();
+                let mut sorted = items;
+                sorted.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(Ordering::Equal)
+                });
+                let keep_count = sorted.len().saturating_sub(drop_count);
+                sorted.truncate(keep_count);
+                evicted += drop_count;
+
+                if sorted.is_empty() {
+                    empty_domains.push(domain);
+                } else {
+                    *queue = BinaryHeap::from(sorted);
+                }
+            }
+        }
+
+        // Clean up empty domains
+        for domain in empty_domains {
+            inner.domain_queues.remove(&domain);
+            inner.active_set.remove(&domain);
+            inner
+                .active_domains
+                .retain(|d| d != &domain);
+        }
+
+        inner.current_size -= evicted;
+        inner.total_evicted += evicted as u64;
+
+        if evicted > 0 {
+            tracing::info!(
+                "Frontier evicted {} low-score URLs (size: {})",
+                evicted,
+                inner.current_size,
+            );
         }
     }
 
@@ -125,18 +312,18 @@ impl Frontier {
 
         for _ in 0..n {
             if let Some(domain) = inner.active_domains.pop_front() {
-                if let Some(queue) = inner.domain_queues.get_mut(&domain) {
-                    if let Some(item) = queue.pop() {
-                        if queue.is_empty() {
-                            inner.domain_queues.remove(&domain);
-                            inner.active_set.remove(&domain);
-                        } else {
-                            inner.active_domains.push_back(domain);
-                        }
-                        return Some(item);
+                let popped = inner.domain_queues.get_mut(&domain).and_then(|q| q.pop());
+                if let Some(item) = popped {
+                    inner.current_size -= 1;
+                    let empty = inner.domain_queues.get(&domain).map_or(true, |q| q.is_empty());
+                    if empty {
+                        inner.domain_queues.remove(&domain);
+                        inner.active_set.remove(&domain);
+                    } else {
+                        inner.active_domains.push_back(domain);
                     }
+                    return Some(item);
                 }
-                // Queue was empty or missing, remove from active set
                 inner.active_set.remove(&domain);
             }
         }
@@ -144,12 +331,7 @@ impl Frontier {
     }
 
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .domain_queues
-            .values()
-            .map(|q| q.len())
-            .sum()
+        self.inner.lock().unwrap().current_size
     }
 
     pub fn active_domain_count(&self) -> usize {

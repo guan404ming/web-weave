@@ -6,7 +6,7 @@ use reqwest::Client;
 use texting_robots::Robot;
 use url::Url;
 
-use crate::config::{ROBOTS_CACHE_TTL, USER_AGENT};
+use crate::config::{ROBOTS_CACHE_MAX_SIZE, ROBOTS_CACHE_TTL, USER_AGENT};
 
 struct CachedRobots {
     robot: Robot,
@@ -74,6 +74,25 @@ impl RobotsManager {
             } else {
                 // Failed fetch is cached, check staleness
                 return Ok(());
+            }
+        }
+
+        // Evict oldest entries if cache is too large
+        if self.cache.len() > ROBOTS_CACHE_MAX_SIZE {
+            let stale_keys: Vec<String> = self
+                .cache
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .value()
+                        .as_ref()
+                        .filter(|c| c.fetched_at.elapsed() > ROBOTS_CACHE_TTL / 2)
+                        .map(|_| entry.key().clone())
+                })
+                .take(ROBOTS_CACHE_MAX_SIZE / 4)
+                .collect();
+            for key in stale_keys {
+                self.cache.remove(&key);
             }
         }
 

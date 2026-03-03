@@ -8,19 +8,19 @@ mod robots;
 mod store;
 
 use std::io::BufRead;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use config::*;
 use dedup::Dedup;
 use fetcher::Fetcher;
-use frontier::{compute_score, Frontier, ScoredUrl, UrlSource};
+use frontier::{compute_score, DomainBackoff, Frontier, ScoredUrl, UrlSource};
 use monitor::Metrics;
 use robots::RobotsManager;
 use store::Store;
@@ -30,6 +30,13 @@ enum DbCommand {
     InsertUrls(Vec<(String, String, u32, String)>),
     MarkFetched(Vec<(String, u16)>),
 }
+
+/// Minimum workers always running.
+const MIN_WORKERS: usize = 10;
+/// How often to re-evaluate worker count.
+const WORKER_ADJUST_INTERVAL: Duration = Duration::from_secs(30);
+/// Workers per active (non-backed-off) domain.
+const WORKERS_PER_DOMAIN: f64 = 0.5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,7 +62,7 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env();
     tracing::info!(
-        "Starting web-weave: workers={}, crawl_duration={}h, resume={}",
+        "Starting web-weave: max_workers={}, crawl_duration={}h, resume={}",
         config.num_workers,
         config.crawl_duration.as_secs() / 3600,
         config.resume,
@@ -83,6 +90,9 @@ async fn main() -> Result<()> {
     let fetcher = Arc::new(Fetcher::new()?);
     let robots = Arc::new(RobotsManager::new(fetcher.client.clone()));
     let metrics = Arc::new(Metrics::new());
+    let backoff = Arc::new(DomainBackoff::new());
+    let active_workers = Arc::new(AtomicUsize::new(0));
+    let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
 
     // DB writer channel
     let (db_tx, db_rx) = mpsc::channel::<DbCommand>(10_000);
@@ -111,27 +121,75 @@ async fn main() -> Result<()> {
         let frontier = frontier.clone();
         let store = store.clone();
         let shutdown = shutdown.clone();
+        let backoff = backoff.clone();
+        let active_workers = active_workers.clone();
         tokio::spawn(async move {
-            monitor_loop(metrics, frontier, store, shutdown).await;
+            monitor_loop(metrics, frontier, store, shutdown, backoff, active_workers).await;
         })
     };
 
-    // Spawn workers
-    let mut worker_handles = Vec::with_capacity(config.num_workers);
-    for id in 0..config.num_workers {
+    // Dynamic worker pool: start with a small batch, scale up as domains grow
+    let max_workers = config.num_workers;
+    let target_workers = Arc::new(AtomicUsize::new(MIN_WORKERS));
+
+    // Worker scaler task
+    let scaler = {
+        let frontier = frontier.clone();
+        let backoff = backoff.clone();
+        let target_workers = target_workers.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(WORKER_ADJUST_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                let domains = frontier.active_domain_count();
+                let backed_off = backoff.backed_off_count();
+                let effective_domains = domains.saturating_sub(backed_off);
+                let desired = ((effective_domains as f64 * WORKERS_PER_DOMAIN) as usize)
+                    .clamp(MIN_WORKERS, max_workers);
+                target_workers.store(desired, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // Spawn worker tasks that self-regulate
+    let mut worker_handles = Vec::with_capacity(max_workers);
+    for id in 0..max_workers {
         let frontier = frontier.clone();
         let dedup = dedup.clone();
         let fetcher = fetcher.clone();
         let robots = robots.clone();
         let metrics = metrics.clone();
+        let backoff = backoff.clone();
         let db_tx = db_tx.clone();
         let shutdown = shutdown.clone();
+        let target_workers = target_workers.clone();
+        let active_workers = active_workers.clone();
+        let fetch_semaphore = fetch_semaphore.clone();
 
         worker_handles.push(tokio::spawn(async move {
-            worker_loop(id, frontier, dedup, fetcher, robots, metrics, db_tx, shutdown).await;
+            worker_loop(
+                id,
+                frontier,
+                dedup,
+                fetcher,
+                robots,
+                metrics,
+                backoff,
+                db_tx,
+                shutdown,
+                target_workers,
+                active_workers,
+                fetch_semaphore,
+            )
+            .await;
         }));
     }
-    drop(db_tx); // workers hold the remaining senders
+    drop(db_tx);
 
     // Wait for shutdown
     tokio::select! {
@@ -145,7 +203,6 @@ async fn main() -> Result<()> {
 
     shutdown.store(true, Ordering::SeqCst);
 
-    // Wait for workers to finish (with timeout)
     let _ = tokio::time::timeout(Duration::from_secs(30), async {
         for h in worker_handles {
             let _ = h.await;
@@ -153,21 +210,19 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    // Wait for DB writer to drain
     let _ = tokio::time::timeout(Duration::from_secs(10), db_writer).await;
 
-    // Final checkpoint
     tracing::info!("Saving final checkpoint...");
     if let Err(e) = save_checkpoint(&frontier, &dedup, &store) {
         tracing::error!("Failed to save final checkpoint: {}", e);
     }
 
-    // Final metrics
     let snapshot = metrics.snapshot(frontier.active_domain_count() as u64);
     tracing::info!("Final metrics: {}", snapshot);
 
     checkpoint.abort();
     monitor.abort();
+    scaler.abort();
 
     tracing::info!("Shutdown complete.");
     Ok(())
@@ -186,7 +241,7 @@ fn load_seeds(frontier: &Frontier, dedup: &Dedup, seed_file: &str) -> Result<()>
         }
 
         if dedup.check_and_insert(&url) {
-            continue; // duplicate
+            continue;
         }
 
         let domain = parser::extract_domain(&url).unwrap_or_default();
@@ -230,43 +285,66 @@ fn save_checkpoint(frontier: &Frontier, dedup: &Dedup, store: &Store) -> Result<
 }
 
 async fn worker_loop(
-    _id: usize,
+    id: usize,
     frontier: Arc<Frontier>,
     dedup: Arc<Dedup>,
     fetcher: Arc<Fetcher>,
     robots: Arc<RobotsManager>,
     metrics: Arc<Metrics>,
+    backoff: Arc<DomainBackoff>,
     db_tx: mpsc::Sender<DbCommand>,
     shutdown: Arc<AtomicBool>,
+    target_workers: Arc<AtomicUsize>,
+    active_workers: Arc<AtomicUsize>,
+    fetch_semaphore: Arc<Semaphore>,
 ) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
 
+        // Dynamic scaling: sleep if this worker exceeds the target count
+        let target = target_workers.load(Ordering::Relaxed);
+        if id >= target {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        active_workers.fetch_add(1, Ordering::Relaxed);
+
         // Pop next URL from frontier
         let scored_url = match frontier.pop() {
             Some(u) => u,
             None => {
+                active_workers.fetch_sub(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
+
+        // Skip domains in backoff
+        if backoff.is_backed_off(&scored_url.domain) {
+            // Re-enqueue the URL so it's not lost
+            frontier.push(scored_url);
+            active_workers.fetch_sub(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
 
         // Check robots.txt
         match robots.is_allowed(&scored_url.url, &scored_url.domain).await {
             Ok(true) => {}
             Ok(false) => {
                 metrics.record_robots_blocked();
+                active_workers.fetch_sub(1, Ordering::Relaxed);
                 continue;
             }
             Err(e) => {
                 tracing::debug!("Robots error for {}: {}", scored_url.domain, e);
-                // Allow on error (per spec)
             }
         }
 
-        // Process sitemaps from robots.txt on first encounter
+        // Process sitemaps from robots.txt
         let sitemaps = robots.get_sitemaps(&scored_url.domain);
         if !sitemaps.is_empty() {
             let mut sitemap_urls = Vec::new();
@@ -293,7 +371,7 @@ async fn worker_loop(
             }
         }
 
-        // Respect crawl-delay if larger than our default rate limit
+        // Respect crawl-delay
         if let Some(delay) = robots.get_crawl_delay(&scored_url.domain) {
             let default_period = PER_DOMAIN_PERIOD.as_secs_f64();
             if delay > default_period {
@@ -301,18 +379,30 @@ async fn worker_loop(
             }
         }
 
+        // Acquire fetch permit to bound concurrent connections
+        let _permit = fetch_semaphore.acquire().await.unwrap();
+
         // Fetch
         let fetch_result = match fetcher.fetch(&scored_url.url, &scored_url.domain).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("Fetch error {}: {}", scored_url.url, e);
                 metrics.record_fetch(0, false);
+                backoff.record_failure(&scored_url.domain);
+                drop(_permit);
+                active_workers.fetch_sub(1, Ordering::Relaxed);
                 continue;
             }
         };
 
         let success = fetch_result.status.is_success();
         metrics.record_fetch(fetch_result.latency_ms, success);
+
+        if success {
+            backoff.record_success(&scored_url.domain);
+        } else {
+            backoff.record_failure(&scored_url.domain);
+        }
 
         // Record fetch in DB
         let _ = db_tx
@@ -322,7 +412,7 @@ async fn worker_loop(
             )]))
             .await;
 
-        // Parse links from HTML or sitemap XML
+        // Parse links
         if let Some(body) = &fetch_result.body {
             let is_xml = fetch_result
                 .content_type
@@ -342,9 +432,7 @@ async fn worker_loop(
                 for link in links {
                     if !dedup.check_and_insert(&link) {
                         let domain = parser::extract_domain(&link).unwrap_or_default();
-                        let is_new = !frontier_has_domain(&frontier, &domain)
-                            && !dedup.contains(&format!("__domain__{}", domain));
-                        // Mark domain as seen in bloom filter
+                        let is_new = !dedup.contains(&format!("__domain__{}", domain));
                         if is_new {
                             dedup.check_and_insert(&format!("__domain__{}", domain));
                         }
@@ -377,12 +465,9 @@ async fn worker_loop(
                 }
             }
         }
-    }
-}
 
-fn frontier_has_domain(_frontier: &Frontier, _domain: &str) -> bool {
-    // We use the bloom filter's __domain__ prefix entries for tracking instead.
-    false
+        active_workers.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn db_writer_task(
@@ -394,24 +479,26 @@ async fn db_writer_task(
     let mut fetch_batch: Vec<(String, u16)> = Vec::new();
 
     loop {
-        // Try to receive with a timeout for batching
         match tokio::time::timeout(BATCH_TIMEOUT, rx.recv()).await {
             Ok(Some(cmd)) => match cmd {
                 DbCommand::InsertUrls(urls) => url_batch.extend(urls),
                 DbCommand::MarkFetched(items) => fetch_batch.extend(items),
             },
-            Ok(None) => break, // channel closed
-            Err(_) => {}       // timeout, flush what we have
+            Ok(None) => break,
+            Err(_) => {}
         }
 
-        // Flush if batch size reached or timeout
-        if url_batch.len() >= BATCH_SIZE || (!url_batch.is_empty() && shutdown.load(Ordering::Relaxed)) {
+        if url_batch.len() >= BATCH_SIZE
+            || (!url_batch.is_empty() && shutdown.load(Ordering::Relaxed))
+        {
             if let Err(e) = store.insert_urls_batch(&url_batch) {
                 tracing::error!("DB insert error: {}", e);
             }
             url_batch.clear();
         }
-        if fetch_batch.len() >= BATCH_SIZE || (!fetch_batch.is_empty() && shutdown.load(Ordering::Relaxed)) {
+        if fetch_batch.len() >= BATCH_SIZE
+            || (!fetch_batch.is_empty() && shutdown.load(Ordering::Relaxed))
+        {
             if let Err(e) = store.mark_fetched_batch(&fetch_batch) {
                 tracing::error!("DB update error: {}", e);
             }
@@ -419,7 +506,6 @@ async fn db_writer_task(
         }
     }
 
-    // Final flush
     if !url_batch.is_empty() {
         let _ = store.insert_urls_batch(&url_batch);
     }
@@ -435,7 +521,7 @@ async fn checkpoint_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
-    interval.tick().await; // skip first immediate tick
+    interval.tick().await;
 
     loop {
         interval.tick().await;
@@ -460,9 +546,11 @@ async fn monitor_loop(
     frontier: Arc<Frontier>,
     store: Arc<Store>,
     shutdown: Arc<AtomicBool>,
+    backoff: Arc<DomainBackoff>,
+    active_workers: Arc<AtomicUsize>,
 ) {
     let mut interval = tokio::time::interval(SNAPSHOT_INTERVAL);
-    interval.tick().await; // skip first immediate tick
+    interval.tick().await;
 
     loop {
         interval.tick().await;
@@ -472,7 +560,15 @@ async fn monitor_loop(
 
         let active_domains = frontier.active_domain_count() as u64;
         let snapshot = metrics.snapshot(active_domains);
-        tracing::info!("METRICS: {}", snapshot);
+        let workers = active_workers.load(Ordering::Relaxed);
+        let backed_off = backoff.backed_off_count();
+        tracing::info!(
+            "METRICS: {} | workers={} backed_off={} frontier_size={}",
+            snapshot,
+            workers,
+            backed_off,
+            frontier.len(),
+        );
         metrics.check_alerts(&snapshot);
 
         if let Err(e) = store.save_metrics(&snapshot) {
