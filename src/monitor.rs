@@ -97,6 +97,7 @@ pub struct Metrics {
     last_fetched: AtomicU64,
     last_discovered: AtomicU64,
     alert_cooldowns: Mutex<HashMap<String, Instant>>,
+    pub latest_snapshot: Mutex<Option<MetricsSnapshot>>,
 }
 
 impl Metrics {
@@ -116,6 +117,7 @@ impl Metrics {
             last_fetched: AtomicU64::new(fetched),
             last_discovered: AtomicU64::new(discovered),
             alert_cooldowns: Mutex::new(HashMap::new()),
+            latest_snapshot: Mutex::new(None),
         }
     }
 

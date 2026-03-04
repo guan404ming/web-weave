@@ -9,6 +9,7 @@ Single-machine URL crawler in Rust. Starts from 1,000 seed URLs and maximizes UR
 | Total discovered URLs | 8,135,425 |
 | Total successfully-crawled URLs | 222,754 |
 | Unique domains reached | 345,827 |
+| Frontier size (peak) | 5,000,000 |
 | Sustained QPS | ~128 |
 | Success rate | 77-78% |
 | Avg latency (p50) | ~550 ms |

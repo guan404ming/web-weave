@@ -31,3 +31,4 @@ logs/
 # Bloom filter checkpoint
 *.Bloom
 *.frontier
+*.backoff

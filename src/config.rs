@@ -77,6 +77,10 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(48);
+        let crawl_mins: u64 = std::env::var("CRAWL_MINS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
 
         Self {
             seed_file: std::env::var("SEED_FILE")
@@ -84,7 +88,7 @@ impl Config {
             db_path: std::env::var("DB_PATH")
                 .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
             num_workers,
-            crawl_duration: Duration::from_secs(crawl_hours * 3600),
+            crawl_duration: Duration::from_secs(crawl_hours * 3600 + crawl_mins * 60),
             resume,
         }
     }

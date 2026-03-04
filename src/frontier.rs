@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use min_max_heap::MinMaxHeap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -80,11 +81,67 @@ struct BackoffEntry {
     backoff_until: Instant,
 }
 
+#[derive(Serialize, Deserialize)]
+struct BackoffSnapshot {
+    domain: String,
+    consecutive_failures: u32,
+    total_successes: u32,
+    total_failures: u32,
+    times_backed_off: u32,
+    remaining_secs: f64,
+}
+
 impl DomainBackoff {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let now = Instant::now();
+        let state = self.state.lock().unwrap();
+        let snapshots: Vec<BackoffSnapshot> = state
+            .iter()
+            .filter_map(|(domain, entry)| {
+                let remaining = entry.backoff_until.saturating_duration_since(now);
+                if remaining.is_zero() && entry.times_backed_off == 0 {
+                    return None; // skip healthy domains with no backoff history
+                }
+                Some(BackoffSnapshot {
+                    domain: domain.clone(),
+                    consecutive_failures: entry.consecutive_failures,
+                    total_successes: entry.total_successes,
+                    total_failures: entry.total_failures,
+                    times_backed_off: entry.times_backed_off,
+                    remaining_secs: remaining.as_secs_f64(),
+                })
+            })
+            .collect();
+        bincode::serialize(&snapshots).context("serialize backoff")
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        let snapshots: Vec<BackoffSnapshot> =
+            bincode::deserialize(data).context("deserialize backoff")?;
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        for s in snapshots {
+            map.insert(
+                s.domain,
+                BackoffEntry {
+                    consecutive_failures: s.consecutive_failures,
+                    total_successes: s.total_successes,
+                    total_failures: s.total_failures,
+                    times_backed_off: s.times_backed_off,
+                    backoff_until: now + std::time::Duration::from_secs_f64(s.remaining_secs),
+                },
+            );
+        }
+        tracing::info!("Restored {} backoff entries", map.len());
+        Ok(Self {
+            state: Mutex::new(map),
+        })
     }
 
     /// Record a successful fetch for a domain.
@@ -195,9 +252,37 @@ impl DomainBackoff {
     }
 }
 
+mod mmheap_serde {
+    use super::*;
+    use serde::ser::SerializeMap;
+
+    pub fn serialize<S: serde::Serializer>(
+        map: &HashMap<String, MinMaxHeap<ScoredUrl>>,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map_ser = s.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            let vec: Vec<&ScoredUrl> = v.iter().collect();
+            map_ser.serialize_entry(k, &vec)?;
+        }
+        map_ser.end()
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<HashMap<String, MinMaxHeap<ScoredUrl>>, D::Error> {
+        let vec_map = HashMap::<String, Vec<ScoredUrl>>::deserialize(d)?;
+        Ok(vec_map
+            .into_iter()
+            .map(|(k, v)| (k, MinMaxHeap::from(v)))
+            .collect())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct FrontierInner {
-    domain_queues: HashMap<String, BinaryHeap<ScoredUrl>>,
+    #[serde(with = "mmheap_serde")]
+    domain_queues: HashMap<String, MinMaxHeap<ScoredUrl>>,
     active_domains: VecDeque<String>,
     active_set: HashSet<String>,
     total_enqueued: u64,
@@ -236,25 +321,32 @@ impl Frontier {
     }
 
     fn push_inner(inner: &mut FrontierInner, item: ScoredUrl) {
-        // Admission control: reject if at capacity
+        // Per-domain cap: if full, replace lowest-score URL if new one is better
+        if let Some(queue) = inner.domain_queues.get_mut(&item.domain) {
+            if queue.len() >= MAX_PER_DOMAIN_URLS {
+                if let Some(min_score) = queue.peek_min().map(|u| u.score) {
+                    if item.score > min_score {
+                        queue.pop_min();
+                        inner.current_size -= 1;
+                    } else {
+                        inner.total_evicted += 1;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Global capacity: reject if full
         if inner.current_size >= FRONTIER_CAPACITY {
             inner.total_evicted += 1;
             return;
-        }
-
-        // Per-domain cap: reject if this domain already has enough queued URLs
-        if let Some(queue) = inner.domain_queues.get(&item.domain) {
-            if queue.len() >= MAX_PER_DOMAIN_URLS {
-                inner.total_evicted += 1;
-                return;
-            }
         }
 
         let domain = item.domain.clone();
         inner
             .domain_queues
             .entry(domain.clone())
-            .or_default()
+            .or_insert_with(MinMaxHeap::new)
             .push(item);
         if inner.active_set.insert(domain.clone()) {
             inner.active_domains.push_back(domain);
@@ -273,7 +365,7 @@ impl Frontier {
 
         for _ in 0..n {
             if let Some(domain) = inner.active_domains.pop_front() {
-                let popped = inner.domain_queues.get_mut(&domain).and_then(|q| q.pop());
+                let popped = inner.domain_queues.get_mut(&domain).and_then(|q| q.pop_max());
                 if let Some(item) = popped {
                     inner.current_size -= 1;
                     let empty = inner.domain_queues.get(&domain).map_or(true, |q| q.is_empty());

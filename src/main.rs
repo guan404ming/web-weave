@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -37,6 +37,9 @@ const MIN_WORKERS: usize = 10;
 const WORKER_ADJUST_INTERVAL: Duration = Duration::from_secs(30);
 /// Workers per active (non-backed-off) domain.
 const WORKERS_PER_DOMAIN: f64 = 0.5;
+/// Dynamic fetch concurrency bounds.
+const MIN_CONCURRENT_FETCHES: usize = 100;
+const MAX_CONCURRENT_FETCHES_CAP: usize = 1000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -72,13 +75,13 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Initialize or restore
-    let (frontier, dedup) = if config.resume {
+    let (frontier, dedup, backoff) = if config.resume {
         restore_from_checkpoint(&store)?
     } else {
         let frontier = Arc::new(Frontier::new());
         let dedup = Arc::new(Dedup::new(BLOOM_EXPECTED_ITEMS, BLOOM_FP_RATE)?);
         load_seeds(&frontier, &dedup, &config.seed_file)?;
-        (frontier, dedup)
+        (frontier, dedup, Arc::new(DomainBackoff::new()))
     };
 
     tracing::info!(
@@ -103,9 +106,9 @@ async fn main() -> Result<()> {
     } else {
         Metrics::new()
     });
-    let backoff = Arc::new(DomainBackoff::new());
     let active_workers = Arc::new(AtomicUsize::new(0));
-    let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+    let fetch_limit = Arc::new(AtomicUsize::new(MAX_CONCURRENT_FETCHES_CAP));
+    let active_fetches = Arc::new(AtomicUsize::new(0));
 
     // DB writer channel
     let (db_tx, db_rx) = mpsc::channel::<DbCommand>(10_000);
@@ -121,10 +124,11 @@ async fn main() -> Result<()> {
     let checkpoint = {
         let frontier = frontier.clone();
         let dedup = dedup.clone();
+        let backoff = backoff.clone();
         let store = store.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            checkpoint_loop(frontier, dedup, store, shutdown).await;
+            checkpoint_loop(frontier, dedup, backoff, store, shutdown).await;
         })
     };
 
@@ -161,7 +165,9 @@ async fn main() -> Result<()> {
     let scaler = {
         let frontier = frontier.clone();
         let backoff = backoff.clone();
+        let metrics = metrics.clone();
         let target_workers = target_workers.clone();
+        let fetch_limit = fetch_limit.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(WORKER_ADJUST_INTERVAL);
@@ -174,9 +180,44 @@ async fn main() -> Result<()> {
                 let domains = frontier.active_domain_count();
                 let backed_off = backoff.backed_off_count();
                 let effective_domains = domains.saturating_sub(backed_off);
-                let desired = ((effective_domains as f64 * WORKERS_PER_DOMAIN) as usize)
-                    .clamp(MIN_WORKERS, max_workers);
-                target_workers.store(desired, Ordering::Relaxed);
+
+                // Read latest metrics from monitor loop
+                let snapshot = metrics.latest_snapshot.lock().unwrap().clone();
+
+                // Worker scaling: domain-based with success rate adjustment
+                let domain_based = (effective_domains as f64 * WORKERS_PER_DOMAIN) as usize;
+                let desired_workers = if let Some(ref s) = snapshot {
+                    if s.success_rate < 0.5 {
+                        domain_based / 2
+                    } else {
+                        domain_based
+                    }
+                } else {
+                    domain_based
+                };
+                let desired_workers = desired_workers.clamp(MIN_WORKERS, max_workers);
+                target_workers.store(desired_workers, Ordering::Relaxed);
+
+                // Fetch concurrency scaling based on health signals
+                let current_limit = fetch_limit.load(Ordering::Relaxed);
+                let new_limit = if let Some(ref s) = snapshot {
+                    if s.success_rate > 0.8 && s.p50_latency_ms < 3000 {
+                        current_limit + 100
+                    } else if s.success_rate < 0.5 || s.p50_latency_ms > 5000 {
+                        current_limit.saturating_sub(100)
+                    } else {
+                        current_limit
+                    }
+                } else {
+                    current_limit
+                };
+                let new_limit = new_limit.clamp(MIN_CONCURRENT_FETCHES, MAX_CONCURRENT_FETCHES_CAP);
+                fetch_limit.store(new_limit, Ordering::Relaxed);
+
+                tracing::info!(
+                    "Scaler: workers={}/{} fetch_limit={} effective_domains={}",
+                    desired_workers, max_workers, new_limit, effective_domains,
+                );
             }
         })
     };
@@ -194,7 +235,8 @@ async fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         let target_workers = target_workers.clone();
         let active_workers = active_workers.clone();
-        let fetch_semaphore = fetch_semaphore.clone();
+        let fetch_limit = fetch_limit.clone();
+        let active_fetches = active_fetches.clone();
 
         worker_handles.push(tokio::spawn(async move {
             worker_loop(
@@ -209,7 +251,8 @@ async fn main() -> Result<()> {
                 shutdown,
                 target_workers,
                 active_workers,
-                fetch_semaphore,
+                fetch_limit,
+                active_fetches,
             )
             .await;
         }));
@@ -238,7 +281,7 @@ async fn main() -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(10), db_writer).await;
 
     tracing::info!("Saving final checkpoint...");
-    if let Err(e) = save_checkpoint(&frontier, &dedup, &store) {
+    if let Err(e) = save_checkpoint(&frontier, &dedup, &backoff, &store) {
         tracing::error!("Failed to save final checkpoint: {}", e);
     }
 
@@ -285,27 +328,43 @@ fn load_seeds(frontier: &Frontier, dedup: &Dedup, seed_file: &str) -> Result<()>
     Ok(())
 }
 
-fn restore_from_checkpoint(store: &Store) -> Result<(Arc<Frontier>, Arc<Dedup>)> {
+fn restore_from_checkpoint(
+    store: &Store,
+) -> Result<(Arc<Frontier>, Arc<Dedup>, Arc<DomainBackoff>)> {
     match store.load_latest_checkpoint()? {
         Some((frontier_data, bloom_data)) => {
             let frontier = Frontier::deserialize(&frontier_data)?;
             let dedup = Dedup::from_bytes(&bloom_data)?;
+            let backoff = match store.load_backoff() {
+                Ok(Some(data)) => DomainBackoff::deserialize(&data)?,
+                _ => {
+                    tracing::info!("No backoff checkpoint, starting fresh");
+                    DomainBackoff::new()
+                }
+            };
             tracing::info!("Restored from checkpoint");
-            Ok((Arc::new(frontier), Arc::new(dedup)))
+            Ok((Arc::new(frontier), Arc::new(dedup), Arc::new(backoff)))
         }
         None => {
             tracing::warn!("No checkpoint found, starting fresh");
             let frontier = Arc::new(Frontier::new());
             let dedup = Arc::new(Dedup::new(BLOOM_EXPECTED_ITEMS, BLOOM_FP_RATE)?);
-            Ok((frontier, dedup))
+            Ok((frontier, dedup, Arc::new(DomainBackoff::new())))
         }
     }
 }
 
-fn save_checkpoint(frontier: &Frontier, dedup: &Dedup, store: &Store) -> Result<()> {
+fn save_checkpoint(
+    frontier: &Frontier,
+    dedup: &Dedup,
+    backoff: &DomainBackoff,
+    store: &Store,
+) -> Result<()> {
     let frontier_data = frontier.serialize()?;
     let bloom_data = dedup.to_bytes()?;
+    let backoff_data = backoff.serialize()?;
     store.save_checkpoint(&frontier_data, &bloom_data)?;
+    store.save_backoff(&backoff_data)?;
     Ok(())
 }
 
@@ -321,7 +380,8 @@ async fn worker_loop(
     shutdown: Arc<AtomicBool>,
     target_workers: Arc<AtomicUsize>,
     active_workers: Arc<AtomicUsize>,
-    fetch_semaphore: Arc<Semaphore>,
+    fetch_limit: Arc<AtomicUsize>,
+    active_fetches: Arc<AtomicUsize>,
 ) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -404,27 +464,43 @@ async fn worker_loop(
             }
         }
 
-        // Wait on rate limiter BEFORE acquiring semaphore (don't waste slots on waiting)
+        // Wait on rate limiter BEFORE acquiring fetch slot
         fetcher.wait_rate_limit(&scored_url.domain).await;
 
-        // Acquire fetch permit to bound concurrent connections
-        let _permit = fetch_semaphore.acquire().await.unwrap();
+        // Acquire dynamic fetch slot
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                active_workers.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+            let active = active_fetches.load(Ordering::Acquire);
+            if active < fetch_limit.load(Ordering::Relaxed) {
+                if active_fetches
+                    .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
 
-        // Fetch (no rate limiter wait, already done above)
+        // Fetch
         let fetch_result = match fetcher.fetch_direct(&scored_url.url).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("Fetch error {}: {}", scored_url.url, e);
                 metrics.record_fetch(0, false);
                 backoff.record_failure(&scored_url.domain);
-                drop(_permit);
+                active_fetches.fetch_sub(1, Ordering::Release);
                 active_workers.fetch_sub(1, Ordering::Relaxed);
                 continue;
             }
         };
 
-        // Release fetch permit immediately after HTTP response is read
-        drop(_permit);
+        // Release fetch slot immediately after HTTP response is read
+        active_fetches.fetch_sub(1, Ordering::Release);
 
         let success = fetch_result.status.is_success();
         metrics.record_fetch(fetch_result.latency_ms, success);
@@ -557,6 +633,7 @@ async fn db_writer_task(
 async fn checkpoint_loop(
     frontier: Arc<Frontier>,
     dedup: Arc<Dedup>,
+    backoff: Arc<DomainBackoff>,
     store: Arc<Store>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -571,7 +648,7 @@ async fn checkpoint_loop(
         }
 
         tracing::info!("Saving checkpoint...");
-        match save_checkpoint(&frontier, &dedup, &store) {
+        match save_checkpoint(&frontier, &dedup, &backoff, &store) {
             Ok(()) => tracing::info!(
                 "Checkpoint saved (frontier={} URLs, {} domains)",
                 frontier.len(),
@@ -606,6 +683,7 @@ async fn monitor_loop(
 
         let active_domains = frontier.active_domain_count() as u64;
         let snapshot = metrics.snapshot(active_domains);
+        *metrics.latest_snapshot.lock().unwrap() = Some(snapshot.clone());
         let workers = active_workers.load(Ordering::Relaxed);
         let backed_off = backoff.backed_off_count();
         let robots_cached = robots.cache_size();
@@ -625,8 +703,8 @@ async fn monitor_loop(
             tracing::error!("Failed to save metrics: {}", e);
         }
 
-        // Periodic cleanup every 5 minutes (every 5 ticks at 60s interval)
-        if tick_count % 5 == 0 {
+        // Periodic cleanup every minute
+        {
             let backoff_cleaned = backoff.cleanup();
             let limiter_before = fetcher.limiter.len();
             fetcher.limiter.retain_recent();

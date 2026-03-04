@@ -140,6 +140,20 @@ impl Store {
         Ok(Some((frontier_data, bloom_data)))
     }
 
+    pub fn save_backoff(&self, data: &[u8]) -> Result<()> {
+        let base = self.db_path.trim_end_matches(".db");
+        std::fs::write(format!("{}.backoff", base), data).context("write backoff checkpoint file")
+    }
+
+    pub fn load_backoff(&self) -> Result<Option<Vec<u8>>> {
+        let base = self.db_path.trim_end_matches(".db");
+        let path = format!("{}.backoff", base);
+        if !std::path::Path::new(&path).exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read(&path).context("read backoff checkpoint file")?))
+    }
+
     /// Load the latest metrics snapshot for resume.
     pub fn load_latest_metrics(&self) -> Result<Option<(u64, u64)>> {
         let conn = self.conn.lock().unwrap();
