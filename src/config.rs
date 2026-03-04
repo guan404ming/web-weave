@@ -18,7 +18,7 @@ pub const NEW_DOMAIN_BONUS: f64 = 50.0;
 pub const SITEMAP_BONUS: f64 = 30.0;
 pub const MAX_URLS_PER_PAGE: usize = 500;
 pub const FRONTIER_CAPACITY: usize = 5_000_000;
-pub const FRONTIER_EVICT_BATCH: usize = 500_000;
+pub const MAX_PER_DOMAIN_URLS: usize = 5;
 
 // Per-domain error backoff
 pub const BACKOFF_THRESHOLD: u32 = 3;
@@ -26,6 +26,7 @@ pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(3600);
 pub const BACKOFF_RATE_THRESHOLD: f64 = 0.5;
 pub const BACKOFF_RATE_MIN_ATTEMPTS: u32 = 5;
+pub const BACKOFF_MAX_ENTRIES: usize = 500_000;
 
 // Alert cooldown
 pub const ALERT_COOLDOWN: Duration = Duration::from_secs(600);

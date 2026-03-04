@@ -561,6 +561,7 @@ async fn checkpoint_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
 
     loop {
@@ -592,6 +593,7 @@ async fn monitor_loop(
     fetcher: Arc<Fetcher>,
 ) {
     let mut interval = tokio::time::interval(SNAPSHOT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
     let mut tick_count: u64 = 0;
 
@@ -607,13 +609,15 @@ async fn monitor_loop(
         let workers = active_workers.load(Ordering::Relaxed);
         let backed_off = backoff.backed_off_count();
         let robots_cached = robots.cache_size();
+        let limiter_size = fetcher.limiter.len();
         tracing::info!(
-            "METRICS: {} | workers={} backed_off={} frontier_size={} robots_cache={}",
+            "METRICS: {} | workers={} backed_off={} frontier_size={} robots_cache={} limiter_keys={}",
             snapshot,
             workers,
             backed_off,
             frontier.len(),
             robots_cached,
+            limiter_size,
         );
         metrics.check_alerts(&snapshot);
 
@@ -624,14 +628,16 @@ async fn monitor_loop(
         // Periodic cleanup every 5 minutes (every 5 ticks at 60s interval)
         if tick_count % 5 == 0 {
             let backoff_cleaned = backoff.cleanup();
+            let limiter_before = fetcher.limiter.len();
             fetcher.limiter.retain_recent();
             fetcher.limiter.shrink_to_fit();
-            if backoff_cleaned > 0 {
-                tracing::info!(
-                    "Cleanup: backoff={} entries removed",
-                    backoff_cleaned,
-                );
-            }
+            let limiter_after = fetcher.limiter.len();
+            tracing::info!(
+                "Cleanup: backoff={} removed, limiter={} -> {}",
+                backoff_cleaned,
+                limiter_before,
+                limiter_after,
+            );
         }
     }
 }

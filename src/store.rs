@@ -34,22 +34,17 @@ impl Store {
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS urls (
-                url TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
                 domain TEXT NOT NULL,
                 depth INTEGER NOT NULL,
-                status INTEGER,
-                source TEXT NOT NULL,
-                discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
-                fetched_at TEXT
+                source TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain);
-
-            CREATE TABLE IF NOT EXISTS domains (
-                domain TEXT PRIMARY KEY,
-                first_seen TEXT NOT NULL DEFAULT (datetime('now')),
-                url_count INTEGER NOT NULL DEFAULT 0,
-                fetched_count INTEGER NOT NULL DEFAULT 0
+            CREATE TABLE IF NOT EXISTS fetched (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                status INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS frontier_checkpoint (
@@ -78,7 +73,7 @@ impl Store {
         .context("create schema")
     }
 
-    /// Batch insert discovered URLs. Uses INSERT OR IGNORE to skip duplicates.
+    /// Batch insert discovered URLs. Append-only, no uniqueness check (bloom filter handles dedup).
     pub fn insert_urls_batch(
         &self,
         urls: &[(String, String, u32, String)],
@@ -90,37 +85,17 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO urls (url, domain, depth, source) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO urls (url, domain, depth, source) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (url, domain, depth, source) in urls {
                 stmt.execute(params![url, domain, depth, source])?;
-            }
-
-            // Update domain counts
-            let mut domain_stmt = tx.prepare_cached(
-                "INSERT INTO domains (domain, url_count) VALUES (?1, 1)
-                 ON CONFLICT(domain) DO UPDATE SET url_count = url_count + 1",
-            )?;
-            for (_, domain, _, _) in urls {
-                domain_stmt.execute(params![domain])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Mark a URL as fetched with the given HTTP status code.
-    #[allow(dead_code)]
-    pub fn mark_fetched(&self, url: &str, status: u16) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE urls SET status = ?1, fetched_at = datetime('now') WHERE url = ?2",
-            params![status as i64, url],
-        )?;
-        Ok(())
-    }
-
-    /// Batch mark URLs as fetched.
+    /// Batch insert fetched URLs. Append-only, no UPDATE needed.
     pub fn mark_fetched_batch(&self, items: &[(String, u16)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -129,70 +104,40 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "UPDATE urls SET status = ?1, fetched_at = datetime('now') WHERE url = ?2",
-            )?;
-            let mut domain_stmt = tx.prepare_cached(
-                "UPDATE domains SET fetched_count = fetched_count + 1 WHERE domain = ?1",
+                "INSERT INTO fetched (url, status) VALUES (?1, ?2)",
             )?;
             for (url, status) in items {
-                stmt.execute(params![*status as i64, url])?;
-                // Extract domain from URL for the domain counter update
-                if let Some(domain) = crate::parser::extract_domain(url) {
-                    domain_stmt.execute(params![domain])?;
-                }
+                stmt.execute(params![url, *status as i64])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Save a checkpoint. Frontier goes in SQLite, bloom goes to file (too large for blob).
+    /// Save a checkpoint. Both frontier and bloom go to files to avoid SQLite blob limits.
     pub fn save_checkpoint(&self, frontier_data: &[u8], bloom_data: &[u8]) -> Result<()> {
-        // Save bloom filter to file
-        let bloom_path = self.bloom_checkpoint_path();
-        std::fs::write(&bloom_path, bloom_data)
+        let base = self.db_path.trim_end_matches(".db");
+        std::fs::write(format!("{}.frontier", base), frontier_data)
+            .context("write frontier checkpoint file")?;
+        std::fs::write(format!("{}.bloom", base), bloom_data)
             .context("write bloom checkpoint file")?;
-
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO frontier_checkpoint (frontier_data, bloom_data) VALUES (?1, X'00')",
-            params![frontier_data],
-        )?;
-        // Keep only the last 3 checkpoints
-        conn.execute(
-            "DELETE FROM frontier_checkpoint WHERE id NOT IN (
-                SELECT id FROM frontier_checkpoint ORDER BY id DESC LIMIT 3
-            )",
-            [],
-        )?;
         Ok(())
     }
 
     /// Load the most recent checkpoint.
     pub fn load_latest_checkpoint(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let frontier_data = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT frontier_data FROM frontier_checkpoint ORDER BY id DESC LIMIT 1",
-            )?;
-            stmt.query_row([], |row| row.get::<_, Vec<u8>>(0))
-                .optional()?
-        };
+        let base = self.db_path.trim_end_matches(".db");
+        let frontier_path = format!("{}.frontier", base);
+        let bloom_path = format!("{}.bloom", base);
 
-        match frontier_data {
-            Some(fd) => {
-                let bloom_path = self.bloom_checkpoint_path();
-                let bloom_data = std::fs::read(&bloom_path)
-                    .context("read bloom checkpoint file")?;
-                Ok(Some((fd, bloom_data)))
-            }
-            None => Ok(None),
+        if !std::path::Path::new(&frontier_path).exists() {
+            return Ok(None);
         }
-    }
 
-    fn bloom_checkpoint_path(&self) -> String {
-        let db_path = self.db_path.clone();
-        format!("{}.bloom", db_path.trim_end_matches(".db"))
+        let frontier_data =
+            std::fs::read(&frontier_path).context("read frontier checkpoint file")?;
+        let bloom_data = std::fs::read(&bloom_path).context("read bloom checkpoint file")?;
+        Ok(Some((frontier_data, bloom_data)))
     }
 
     /// Load the latest metrics snapshot for resume.

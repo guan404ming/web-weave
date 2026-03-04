@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    BACKOFF_BASE, BACKOFF_MAX, BACKOFF_RATE_MIN_ATTEMPTS, BACKOFF_RATE_THRESHOLD,
-    BACKOFF_THRESHOLD, DEPTH_WEIGHT, FRONTIER_CAPACITY, FRONTIER_EVICT_BATCH, MAX_DEPTH,
-    NEW_DOMAIN_BONUS, SITEMAP_BONUS,
+    BACKOFF_BASE, BACKOFF_MAX, BACKOFF_MAX_ENTRIES, BACKOFF_RATE_MIN_ATTEMPTS,
+    BACKOFF_RATE_THRESHOLD, BACKOFF_THRESHOLD, DEPTH_WEIGHT, FRONTIER_CAPACITY,
+    MAX_DEPTH, MAX_PER_DOMAIN_URLS, NEW_DOMAIN_BONUS, SITEMAP_BONUS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,12 +172,25 @@ impl DomainBackoff {
             .count()
     }
 
-    /// Remove expired backoff entries to free memory.
+    /// Remove expired backoff entries and enforce max size to bound memory.
     pub fn cleanup(&self) -> usize {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
         let before = state.len();
+        // Remove expired entries
         state.retain(|_, e| now < e.backoff_until);
+        // If still over cap, drop entries closest to expiry
+        if state.len() > BACKOFF_MAX_ENTRIES {
+            let mut entries: Vec<(String, Instant)> = state
+                .iter()
+                .map(|(k, e)| (k.clone(), e.backoff_until))
+                .collect();
+            entries.sort_by_key(|(_, t)| *t);
+            let to_remove = state.len() - BACKOFF_MAX_ENTRIES;
+            for (key, _) in entries.into_iter().take(to_remove) {
+                state.remove(&key);
+            }
+        }
         before - state.len()
     }
 }
@@ -213,7 +226,6 @@ impl Frontier {
     pub fn push(&self, item: ScoredUrl) {
         let mut inner = self.inner.lock().unwrap();
         Self::push_inner(&mut inner, item);
-        Self::maybe_evict(&mut inner);
     }
 
     pub fn push_batch(&self, items: Vec<ScoredUrl>) {
@@ -221,10 +233,23 @@ impl Frontier {
         for item in items {
             Self::push_inner(&mut inner, item);
         }
-        Self::maybe_evict(&mut inner);
     }
 
     fn push_inner(inner: &mut FrontierInner, item: ScoredUrl) {
+        // Admission control: reject if at capacity
+        if inner.current_size >= FRONTIER_CAPACITY {
+            inner.total_evicted += 1;
+            return;
+        }
+
+        // Per-domain cap: reject if this domain already has enough queued URLs
+        if let Some(queue) = inner.domain_queues.get(&item.domain) {
+            if queue.len() >= MAX_PER_DOMAIN_URLS {
+                inner.total_evicted += 1;
+                return;
+            }
+        }
+
         let domain = item.domain.clone();
         inner
             .domain_queues
@@ -236,79 +261,6 @@ impl Frontier {
         }
         inner.total_enqueued += 1;
         inner.current_size += 1;
-    }
-
-    /// Evict lowest-score URLs when significantly over capacity.
-    fn maybe_evict(inner: &mut FrontierInner) {
-        if inner.current_size <= FRONTIER_CAPACITY + FRONTIER_EVICT_BATCH {
-            return;
-        }
-
-        let to_evict = inner.current_size - FRONTIER_CAPACITY;
-
-        // Trim largest domain queues first (they contribute most to bloat)
-        let mut evicted = 0;
-        let mut empty_domains = Vec::new();
-
-        // Strategy: trim the largest queues first (they contribute most to bloat)
-        let mut domain_sizes: Vec<(String, usize)> = inner
-            .domain_queues
-            .iter()
-            .map(|(d, q)| (d.clone(), q.len()))
-            .collect();
-        domain_sizes.sort_by(|a, b| b.1.cmp(&a.1));
-
-        for (domain, _) in domain_sizes {
-            if evicted >= to_evict {
-                break;
-            }
-            if let Some(queue) = inner.domain_queues.get_mut(&domain) {
-                // Keep at most half of each large queue's items
-                let keep = queue.len() / 2;
-                let drop_count = (queue.len() - keep).min(to_evict - evicted);
-                if drop_count == 0 {
-                    continue;
-                }
-
-                // Drain into vec, sort, keep top, rebuild
-                let items: Vec<ScoredUrl> = std::mem::take(queue).into_vec();
-                let mut sorted = items;
-                sorted.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(Ordering::Equal)
-                });
-                let keep_count = sorted.len().saturating_sub(drop_count);
-                sorted.truncate(keep_count);
-                evicted += drop_count;
-
-                if sorted.is_empty() {
-                    empty_domains.push(domain);
-                } else {
-                    *queue = BinaryHeap::from(sorted);
-                }
-            }
-        }
-
-        // Clean up empty domains
-        for domain in empty_domains {
-            inner.domain_queues.remove(&domain);
-            inner.active_set.remove(&domain);
-            inner
-                .active_domains
-                .retain(|d| d != &domain);
-        }
-
-        inner.current_size -= evicted;
-        inner.total_evicted += evicted as u64;
-
-        if evicted > 0 {
-            tracing::debug!(
-                "Frontier evicted {} low-score URLs (size: {})",
-                evicted,
-                inner.current_size,
-            );
-        }
     }
 
     /// Pop the highest-priority URL using round-robin across domains.
