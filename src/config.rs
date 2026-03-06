@@ -21,9 +21,9 @@ pub const FRONTIER_CAPACITY: usize = 5_000_000;
 pub const MAX_PER_DOMAIN_URLS: usize = 5;
 
 // Per-domain error backoff
-pub const BACKOFF_THRESHOLD: u32 = 3;
-pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
-pub const BACKOFF_MAX: Duration = Duration::from_secs(3600);
+pub const BACKOFF_THRESHOLD: u32 = 1;
+pub const BACKOFF_BASE: Duration = Duration::from_secs(300);
+pub const BACKOFF_MAX: Duration = Duration::from_secs(7200);
 pub const BACKOFF_RATE_THRESHOLD: f64 = 0.5;
 pub const BACKOFF_RATE_MIN_ATTEMPTS: u32 = 5;
 pub const BACKOFF_MAX_ENTRIES: usize = 500_000;

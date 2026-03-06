@@ -234,8 +234,10 @@ impl DomainBackoff {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
         let before = state.len();
-        // Remove expired entries
-        state.retain(|_, e| now < e.backoff_until);
+        // Remove only fully healthy expired entries
+        state.retain(|_, e| {
+            now < e.backoff_until || e.times_backed_off > 0 || e.consecutive_failures > 0
+        });
         // If still over cap, drop entries closest to expiry
         if state.len() > BACKOFF_MAX_ENTRIES {
             let mut entries: Vec<(String, Instant)> = state

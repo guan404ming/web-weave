@@ -706,12 +706,11 @@ async fn monitor_loop(
             tracing::error!("Failed to save metrics: {}", e);
         }
 
-        // Periodic cleanup every minute
-        {
+        // Periodic cleanup every 5 minutes
+        if tick_count % 5 == 0 {
             let backoff_cleaned = backoff.cleanup();
             let limiter_before = fetcher.limiter.len();
             fetcher.limiter.retain_recent();
-            fetcher.limiter.shrink_to_fit();
             let limiter_after = fetcher.limiter.len();
             tracing::info!(
                 "Cleanup: backoff={} removed, limiter={} -> {}",
